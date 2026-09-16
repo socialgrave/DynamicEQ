@@ -1,6 +1,13 @@
-name: Build DynamicEQ Dylib
+name: Build & Release DynamicEQ
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -21,8 +28,21 @@ jobs:
         -framework AudioToolbox -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore \
         Tweak.m fishhook.c -o DynamicEQ.dylib
 
-    - name: Upload Dylib
-      uses: actions/upload-artifact@v4
+    - name: Upload to Releases
+      uses: softprops/action-gh-release@v2
       with:
-        name: DynamicEQ.dylib
-        path: DynamicEQ.dylib
+        tag_name: v1.0.0
+        name: DynamicEQ v1.0.0
+        body: |
+          🚀 **Официальный релиз DynamicEQ PRO v1.0.0**
+          
+          ### Что внутри:
+          - 10-полосный параметрический эквалайзер
+          - Защита от клиппинга и прострелов (Tape Saturation `tanh`)
+          - Режим инфра-баса `SubShelf 20-55Hz`
+          - Сохранение пресетов и импорт кодов
+          - Кнопка сравнения `EQ ON/OFF`
+          - Живой VU-meter индикатор
+        files: DynamicEQ.dylib
+        draft: false
+        prerelease: false
