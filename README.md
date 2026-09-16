@@ -17,7 +17,7 @@
 
 ## 📦 Установка (.dylib)
 1. Зайдите в раздел **Actions** -> Скачайте артефакт **`DynamicEQ.dylib`**.
-2. Используйте утилиту подписи (**ESign, TrollStore, Scarlet, Sideloadly**).
+2. Используйте утилиту подписи (**ESign, TrollStore, Scarlet, Sideloadly, Feather и др.**).
 3. Инжектируйте `DynamicEQ.dylib` в ваш `.ipa` файл и установите на iOS.
 
 ## 🛠️ Сборка
