@@ -10,10 +10,10 @@
 #endif
 
 #define NUM_BANDS 7
-static double FREQUENCIES[NUM_BANDS] = {20.0, 35.0, 60.0, 100.0, 250.0, 500.0, 1000.0};
-static double default_gains[NUM_BANDS] = {6.0, 8.0, 4.0, -3.0, 0.0, 0.0, 0.0};
+static double FREQUENCIES[NUM_BANDS] = {70.0, 35.0, 60.0, 100.0, 250.0, 500.0, 1000.0}; // Band 0 is Low-Shelf Cutoff at 70Hz
+static double default_gains[NUM_BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0}; // 3D Subwoofer preset
 static double GAINS_DB[NUM_BANDS];
-static double PREAMP_DB = -4.5;
+static double PREAMP_DB = -5.0;
 static uint64_t gProcessedBufferCount = 0;
 
 typedef struct {
@@ -35,10 +35,39 @@ static inline double kill_denormal(double val) {
     return (fabs(val) < 1.0e-15) ? 0.0 : val;
 }
 
-static void update_biquad_single(int i, double sampleRate) {
-    double A = pow(10.0, GAINS_DB[i] / 40.0);
-    double omega = 2.0 * M_PI * FREQUENCIES[i] / sampleRate;
-    double alpha = sin(omega) / (2.0 * 1.41);
+// Low-Shelf Filter for Deep Sub-Bass (Band 0)
+static void init_low_shelf(BiquadFilter64 *f, double freq, double gainDb, double sampleRate) {
+    if (fabs(gainDb) < 0.01) {
+        f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
+        return;
+    }
+    double A = pow(10.0, gainDb / 40.0);
+    double w0 = 2.0 * M_PI * freq / sampleRate;
+    double cos_w0 = cos(w0);
+    double sin_w0 = sin(w0);
+    double alpha = sin_w0 / 2.0 * sqrt((A + 1.0/A)*(1.0/0.707 - 1.0) + 2.0);
+    double beta = 2.0 * sqrt(A) * alpha;
+
+    double b0 = A * ((A + 1.0) - (A - 1.0)*cos_w0 + beta);
+    double b1 = 2.0 * A * ((A - 1.0) - (A + 1.0)*cos_w0);
+    double b2 = A * ((A + 1.0) - (A - 1.0)*cos_w0 - beta);
+    double a0 = (A + 1.0) + (A - 1.0)*cos_w0 + beta;
+    double a1 = -2.0 * ((A - 1.0) + (A + 1.0)*cos_w0);
+    double a2 = (A + 1.0) + (A - 1.0)*cos_w0 - beta;
+
+    f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0;
+    f->a1 = a1 / a0; f->a2 = a2 / a0;
+}
+
+// Peaking Filter for other bands
+static void init_peaking(BiquadFilter64 *f, double freq, double gainDb, double sampleRate, double Q) {
+    if (fabs(gainDb) < 0.01) {
+        f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
+        return;
+    }
+    double A = pow(10.0, gainDb / 40.0);
+    double omega = 2.0 * M_PI * freq / sampleRate;
+    double alpha = sin(omega) / (2.0 * Q);
     double cos_w = cos(omega);
 
     double b0 = 1.0 + alpha * A;
@@ -48,8 +77,16 @@ static void update_biquad_single(int i, double sampleRate) {
     double a1 = -2.0 * cos_w;
     double a2 = 1.0 - alpha / A;
 
-    filters[i].b0 = b0 / a0; filters[i].b1 = b1 / a0; filters[i].b2 = b2 / a0;
-    filters[i].a1 = a1 / a0; filters[i].a2 = a2 / a0;
+    f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0;
+    f->a1 = a1 / a0; f->a2 = a2 / a0;
+}
+
+static void update_biquad_single(int i, double sampleRate) {
+    if (i == 0) {
+        init_low_shelf(&filters[0], FREQUENCIES[0], GAINS_DB[0], sampleRate);
+    } else {
+        init_peaking(&filters[i], FREQUENCIES[i], GAINS_DB[i], sampleRate, 1.30);
+    }
 }
 
 static void update_all_biquads(double sampleRate) {
@@ -126,10 +163,8 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
 static void process_audio_buffer_list(AudioBufferList *ioData) {
     if (!ioData || ioData->mNumberBuffers == 0) return;
-    
     double preampFactor = pow(10.0, PREAMP_DB / 20.0);
 
-    // Случай 1: Non-Interleaved Стерео (2 отдельных буфера для L и R)
     if (ioData->mNumberBuffers == 2) {
         gProcessedBufferCount++;
         float *samplesL = (float *)ioData->mBuffers[0].mData;
@@ -150,9 +185,7 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
                 samplesR[i] = fast_soft_clip((float)sR);
             }
         }
-    } 
-    // Случай 2: Interleaved Стерео (1 буфер)
-    else if (ioData->mNumberBuffers == 1) {
+    } else if (ioData->mNumberBuffers == 1) {
         AudioBuffer buf = ioData->mBuffers[0];
         process_pcm_raw(buf.mData, buf.mDataByteSize, buf.mNumberChannels > 0 ? buf.mNumberChannels : 2, YES, 32);
     }
@@ -170,7 +203,6 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
         AudioStreamBasicDescription format;
         UInt32 propSize = sizeof(format);
         OSStatus err = AudioQueueGetProperty(inAQ, kAudioQueueProperty_StreamDescription, &format, &propSize);
-        
         if (err == noErr && format.mFormatID == kAudioFormatLinearPCM) {
             static double lastSampleRate = 0.0;
             double currentSampleRate = format.mSampleRate > 0 ? format.mSampleRate : 44100.0;
@@ -281,7 +313,7 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         _statusLabel.text = @"🔴 Ожидание звука... (Включите трек)";
         _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
     } else {
-        _statusLabel.text = [NSString stringWithFormat:@"🟢 Активен (Обработано: %llu)", gProcessedBufferCount];
+        _statusLabel.text = [NSString stringWithFormat:@"🟢 3D Sub DSP Active (%llu buf)", gProcessedBufferCount];
         _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
     }
 }
@@ -391,10 +423,10 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
 
         int y = 6;
         for (int i = 0; i < NUM_BANDS; i++) {
-            UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, y, 52, 26)];
-            lbl.text = [NSString stringWithFormat:@"%.0fHz", FREQUENCIES[i]];
-            lbl.textColor = [UIColor whiteColor];
-            lbl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+            UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, y, 55, 26)];
+            lbl.text = (i == 0) ? @"SubShelf" : [NSString stringWithFormat:@"%.0fHz", FREQUENCIES[i]];
+            lbl.textColor = (i == 0) ? [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0] : [UIColor whiteColor];
+            lbl.font = [UIFont systemFontOfSize:(i == 0 ? 11 : 13) weight:UIFontWeightSemibold];
             [scroll addSubview:lbl];
 
             UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -561,15 +593,23 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
     [self triggerHaptic:0];
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Пресеты" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🔄 Flat (Сбросить всё в 0)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🔄 Flat (Сбросить в 0)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = 0.0;
         PREAMP_DB = 0.0;
         [self applyGainsAndRefreshUI];
     }]];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🔊 Super Bass (Глубокий саб)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = default_gains[i];
-        PREAMP_DB = -4.5;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🔊 3D Subwoofer (Глубокий гул)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double sub_gains[NUM_BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0};
+        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = sub_gains[i];
+        PREAMP_DB = -5.0;
+        [self applyGainsAndRefreshUI];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🎧 Club Punch (Плотный кач)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double club_gains[NUM_BANDS] = {6.0, 8.0, 6.0, 2.0, -3.0, 0.0, 2.0};
+        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = club_gains[i];
+        PREAMP_DB = -6.0;
         [self applyGainsAndRefreshUI];
     }]];
 
