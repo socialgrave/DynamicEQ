@@ -6,7 +6,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Fetch Fishhook
       run: |
@@ -15,14 +15,14 @@ jobs:
 
     - name: Compile Dylib
       run: |
-        clang -dynamiclib -O3 \
+        clang -dynamiclib -O3 -w -fobjc-arc \
         -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
         -arch arm64 -miphoneos-version-min=14.0 \
         -framework AudioToolbox -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore \
         Tweak.m fishhook.c -o DynamicEQ.dylib
 
     - name: Upload Dylib
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: DynamicEQ.dylib
         path: DynamicEQ.dylib
