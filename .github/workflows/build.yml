@@ -1,10 +1,12 @@
 name: Build & Release DynamicEQ
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Номер версии релиза'
+        required: true
+        default: 'v1.1.0'
 
 permissions:
   contents: write
@@ -28,21 +30,20 @@ jobs:
         -framework AudioToolbox -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore \
         Tweak.m fishhook.c -o DynamicEQ.dylib
 
-    - name: Upload to Releases
+    - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: v1.0.0
-        name: DynamicEQ v1.0.0
+        tag_name: ${{ inputs.version }}
+        name: DynamicEQ ${{ inputs.version }}
         body: |
-          🚀 **Официальный релиз DynamicEQ PRO v1.0.0**
+          🚀 **Релиз DynamicEQ ${{ inputs.version }}**
           
-          ### Что внутри:
+          - Защита от микро-скачков при старте треков (Soft Fade-In)
+          - Аварийный предохранитель выбросов (Spike Guard)
           - 10-полосный параметрический эквалайзер
           - Защита от клиппинга и прострелов (Tape Saturation `tanh`)
           - Режим инфра-баса `SubShelf 20-55Hz`
           - Сохранение пресетов и импорт кодов
-          - Кнопка сравнения `EQ ON/OFF`
-          - Живой VU-meter индикатор
         files: DynamicEQ.dylib
         draft: false
         prerelease: false
