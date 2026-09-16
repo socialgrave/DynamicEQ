@@ -18,6 +18,10 @@ static BOOL gEQEnabled = YES;
 static uint64_t gProcessedBufferCount = 0;
 static float gLivePeakLevel = 0.0f;
 
+static double gLastAudioTime = 0.0;
+static int gFadeInCounter = 0;
+#define FADE_IN_SAMPLES 400
+
 typedef struct {
     double b0, b1, b2, a1, a2;
     double x1_L, x2_L, y1_L, y2_L;
@@ -27,13 +31,23 @@ typedef struct {
 static BiquadFilter64 filters[NUM_BANDS];
 static double gCurrentSampleRate = 44100.0;
 
+// Безопасный сатуратор с жестким ограничением граничных значений
 static inline float tape_saturate(double x) {
     if (isnan(x) || isinf(x)) return 0.0f;
+    if (x > 3.0) return 0.99f;
+    if (x < -3.0) return -0.99f;
     return (float)tanh(x * 0.65);
 }
 
 static inline double kill_denormal(double val) {
     return (fabs(val) < 1.0e-15) ? 0.0 : val;
+}
+
+static void reset_all_filter_mem(void) {
+    for (int i = 0; i < NUM_BANDS; i++) {
+        filters[i].x1_L = filters[i].x2_L = filters[i].y1_L = filters[i].y2_L = 0.0;
+        filters[i].x1_R = filters[i].x2_R = filters[i].y1_R = filters[i].y2_R = 0.0;
+    }
 }
 
 static void init_low_shelf(BiquadFilter64 *f, double freq, double gainDb, double sampleRate) {
@@ -106,10 +120,16 @@ static void update_all_biquads(double sampleRate) {
     for (int i = 0; i < NUM_BANDS; i++) {
         update_biquad_single(i, sampleRate);
     }
+    reset_all_filter_mem();
 }
 
+// Процессинг каналов с защитой от выбросов (Spike Guard)
 static inline double process_L(BiquadFilter64 *f, double inSample) {
     double out = f->b0 * inSample + f->b1 * f->x1_L + f->b2 * f->x2_L - f->a1 * f->y1_L - f->a2 * f->y2_L;
+    if (fabs(out) > 4.0 || isnan(out)) { // Ловушка аномальных выбросов
+        f->x1_L = f->x2_L = f->y1_L = f->y2_L = 0.0;
+        return 0.0;
+    }
     f->x2_L = f->x1_L; f->x1_L = inSample;
     f->y2_L = kill_denormal(f->y1_L); f->y1_L = kill_denormal(out);
     return out;
@@ -117,13 +137,27 @@ static inline double process_L(BiquadFilter64 *f, double inSample) {
 
 static inline double process_R(BiquadFilter64 *f, double inSample) {
     double out = f->b0 * inSample + f->b1 * f->x1_R + f->b2 * f->x2_R - f->a1 * f->y1_R - f->a2 * f->y2_R;
+    if (fabs(out) > 4.0 || isnan(out)) { // Ловушка аномальных выбросов
+        f->x1_R = f->x2_R = f->y1_R = f->y2_R = 0.0;
+        return 0.0;
+    }
     f->x2_R = f->x1_R; f->x1_R = inSample;
     f->y2_R = kill_denormal(f->y1_R); f->y1_R = kill_denormal(out);
     return out;
 }
 
+static void check_stream_gap(void) {
+    double now = CACurrentMediaTime();
+    if (now - gLastAudioTime > 0.20) {
+        reset_all_filter_mem();
+        gFadeInCounter = 0;
+    }
+    gLastAudioTime = now;
+}
+
 static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL isFloat, UInt32 bitsPerChannel) {
     if (!data || byteSize == 0) return;
+    check_stream_gap();
     gProcessedBufferCount++;
 
     if (!gEQEnabled) return;
@@ -138,8 +172,14 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
         if (channels >= 2) {
             for (UInt32 i = 0; i < totalSamples; i += channels) {
-                double sL = (double)samples[i] * preampFactor;
-                double sR = (double)samples[i + 1] * preampFactor;
+                double ramp = 1.0;
+                if (gFadeInCounter < FADE_IN_SAMPLES) {
+                    ramp = (double)gFadeInCounter / (double)FADE_IN_SAMPLES;
+                    gFadeInCounter++;
+                }
+
+                double sL = (double)samples[i] * preampFactor * ramp;
+                double sR = (double)samples[i + 1] * preampFactor * ramp;
                 for (int b = 0; b < NUM_BANDS; b++) {
                     sL = process_L(&filters[b], sL);
                     sR = process_R(&filters[b], sR);
@@ -158,8 +198,14 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
         if (channels >= 2) {
             for (UInt32 i = 0; i < totalSamples; i += channels) {
-                double sL = ((double)samples[i] / 32768.0) * preampFactor;
-                double sR = ((double)samples[i + 1] / 32768.0) * preampFactor;
+                double ramp = 1.0;
+                if (gFadeInCounter < FADE_IN_SAMPLES) {
+                    ramp = (double)gFadeInCounter / (double)FADE_IN_SAMPLES;
+                    gFadeInCounter++;
+                }
+
+                double sL = ((double)samples[i] / 32768.0) * preampFactor * ramp;
+                double sR = ((double)samples[i + 1] / 32768.0) * preampFactor * ramp;
                 for (int b = 0; b < NUM_BANDS; b++) {
                     sL = process_L(&filters[b], sL);
                     sR = process_R(&filters[b], sR);
@@ -177,6 +223,7 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
 static void process_audio_buffer_list(AudioBufferList *ioData) {
     if (!ioData || ioData->mNumberBuffers == 0) return;
+    check_stream_gap();
     if (!gEQEnabled) { gProcessedBufferCount++; return; }
 
     double preampFactor = pow(10.0, PREAMP_DB / 20.0);
@@ -190,8 +237,14 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
 
         if (samplesL && samplesR) {
             for (UInt32 i = 0; i < totalSamples; i++) {
-                double sL = (double)samplesL[i] * preampFactor;
-                double sR = (double)samplesR[i] * preampFactor;
+                double ramp = 1.0;
+                if (gFadeInCounter < FADE_IN_SAMPLES) {
+                    ramp = (double)gFadeInCounter / (double)FADE_IN_SAMPLES;
+                    gFadeInCounter++;
+                }
+
+                double sL = (double)samplesL[i] * preampFactor * ramp;
+                double sR = (double)samplesR[i] * preampFactor * ramp;
 
                 for (int b = 0; b < NUM_BANDS; b++) {
                     sL = process_L(&filters[b], sL);
@@ -401,7 +454,6 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
         [contentView addSubview:title];
 
-        // Bypass Toggle Button
         self->_bypassBtn = [UIButton buttonWithType:UIButtonTypeSystem];
         self->_bypassBtn.frame = CGRectMake(115, 12, 48, 24);
         [self updateBypassBtnUI];
@@ -631,9 +683,6 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
     [[NSUserDefaults standardUserDefaults] setDouble:slider.value forKey:@"eq_preamp"];
 }
 
-// ============================================================================
-// ИМПОРТ / ЭКСПОРТ И ПРЕСЕТЫ
-// ============================================================================
 - (void)showCodeMenu {
     [self triggerHaptic:0];
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Код настроек" message:@"Скопируйте или вставьте код:" preferredStyle:UIAlertControllerStyleActionSheet];
