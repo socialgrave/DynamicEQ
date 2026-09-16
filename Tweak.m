@@ -14,6 +14,7 @@ static double FREQUENCIES[NUM_BANDS] = {20.0, 35.0, 60.0, 100.0, 250.0, 500.0, 1
 static double default_gains[NUM_BANDS] = {6.0, 8.0, 4.0, -3.0, 0.0, 0.0, 0.0};
 static double GAINS_DB[NUM_BANDS];
 static double PREAMP_DB = -4.5;
+static uint64_t gProcessedBufferCount = 0;
 
 typedef struct {
     double b0, b1, b2, a1, a2;
@@ -72,7 +73,97 @@ static inline double process_R(BiquadFilter64 *f, double inSample) {
     return out;
 }
 
+static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL isFloat, UInt32 bitsPerChannel) {
+    if (!data || byteSize == 0) return;
+    gProcessedBufferCount++;
+
+    double preampFactor = pow(10.0, PREAMP_DB / 20.0);
+
+    if (isFloat || bitsPerChannel == 32) {
+        float *samples = (float *)data;
+        UInt32 totalSamples = byteSize / sizeof(float);
+        totalSamples -= (totalSamples % (channels > 0 ? channels : 1));
+
+        if (channels >= 2) {
+            for (UInt32 i = 0; i < totalSamples; i += channels) {
+                double sL = (double)samples[i] * preampFactor;
+                double sR = (double)samples[i + 1] * preampFactor;
+                for (int b = 0; b < NUM_BANDS; b++) {
+                    sL = process_L(&filters[b], sL);
+                    sR = process_R(&filters[b], sR);
+                }
+                samples[i]     = fast_soft_clip((float)sL);
+                samples[i + 1] = fast_soft_clip((float)sR);
+            }
+        } else if (channels == 1) {
+            for (UInt32 i = 0; i < totalSamples; i++) {
+                double sL = (double)samples[i] * preampFactor;
+                for (int b = 0; b < NUM_BANDS; b++) {
+                    sL = process_L(&filters[b], sL);
+                }
+                samples[i] = fast_soft_clip((float)sL);
+            }
+        }
+    } else if (bitsPerChannel == 16) {
+        int16_t *samples = (int16_t *)data;
+        UInt32 totalSamples = byteSize / sizeof(int16_t);
+        totalSamples -= (totalSamples % (channels > 0 ? channels : 1));
+
+        if (channels >= 2) {
+            for (UInt32 i = 0; i < totalSamples; i += channels) {
+                double sL = ((double)samples[i] / 32768.0) * preampFactor;
+                double sR = ((double)samples[i + 1] / 32768.0) * preampFactor;
+                for (int b = 0; b < NUM_BANDS; b++) {
+                    sL = process_L(&filters[b], sL);
+                    sR = process_R(&filters[b], sR);
+                }
+                samples[i]     = (int16_t)(fast_soft_clip((float)sL) * 32767.0f);
+                samples[i + 1] = (int16_t)(fast_soft_clip((float)sR) * 32767.0f);
+            }
+        }
+    }
+}
+
+static void process_audio_buffer_list(AudioBufferList *ioData) {
+    if (!ioData || ioData->mNumberBuffers == 0) return;
+    
+    double preampFactor = pow(10.0, PREAMP_DB / 20.0);
+
+    // Случай 1: Non-Interleaved Стерео (2 отдельных буфера для L и R)
+    if (ioData->mNumberBuffers == 2) {
+        gProcessedBufferCount++;
+        float *samplesL = (float *)ioData->mBuffers[0].mData;
+        float *samplesR = (float *)ioData->mBuffers[1].mData;
+        UInt32 totalSamples = ioData->mBuffers[0].mDataByteSize / sizeof(float);
+
+        if (samplesL && samplesR) {
+            for (UInt32 i = 0; i < totalSamples; i++) {
+                double sL = (double)samplesL[i] * preampFactor;
+                double sR = (double)samplesR[i] * preampFactor;
+
+                for (int b = 0; b < NUM_BANDS; b++) {
+                    sL = process_L(&filters[b], sL);
+                    sR = process_R(&filters[b], sR);
+                }
+
+                samplesL[i] = fast_soft_clip((float)sL);
+                samplesR[i] = fast_soft_clip((float)sR);
+            }
+        }
+    } 
+    // Случай 2: Interleaved Стерео (1 буфер)
+    else if (ioData->mNumberBuffers == 1) {
+        AudioBuffer buf = ioData->mBuffers[0];
+        process_pcm_raw(buf.mData, buf.mDataByteSize, buf.mNumberChannels > 0 ? buf.mNumberChannels : 2, YES, 32);
+    }
+}
+
+// ============================================================================
+// ХУКИ
+// ============================================================================
 static OSStatus (*orig_AudioQueueEnqueueBuffer)(AudioQueueRef, AudioQueueBufferRef, UInt32, const AudioStreamPacketDescription *);
+static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef, AudioConverterComplexInputDataProc, void *, UInt32 *, AudioBufferList *, AudioStreamPacketDescription *);
 
 OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, UInt32 inNumPacketDescs, const AudioStreamPacketDescription *inPacketDescs) {
     if (inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0) {
@@ -83,56 +174,37 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
         if (err == noErr && format.mFormatID == kAudioFormatLinearPCM) {
             static double lastSampleRate = 0.0;
             double currentSampleRate = format.mSampleRate > 0 ? format.mSampleRate : 44100.0;
-            
             if (lastSampleRate != currentSampleRate) {
                 update_all_biquads(currentSampleRate);
                 lastSampleRate = currentSampleRate;
             }
-
-            BOOL isFloat = (format.mFormatFlags & kLinearPCMFormatFlagIsFloat) != 0;
-            UInt32 channels = format.mChannelsPerFrame;
-            double preampFactor = pow(10.0, PREAMP_DB / 20.0);
-
-            if (isFloat && format.mBitsPerChannel == 32) {
-                float *samples = (float *)inBuffer->mAudioData;
-                UInt32 totalSamples = inBuffer->mAudioDataByteSize / sizeof(float);
-                totalSamples -= (totalSamples % (channels > 0 ? channels : 1));
-
-                if (channels == 2) {
-                    for (UInt32 i = 0; i < totalSamples; i += 2) {
-                        double sL = (double)samples[i] * preampFactor;
-                        double sR = (double)samples[i + 1] * preampFactor;
-                        for (int b = 0; b < NUM_BANDS; b++) {
-                            sL = process_L(&filters[b], sL);
-                            sR = process_R(&filters[b], sR);
-                        }
-                        samples[i]     = fast_soft_clip((float)sL);
-                        samples[i + 1] = fast_soft_clip((float)sR);
-                    }
-                }
-            } else if (!isFloat && format.mBitsPerChannel == 16) {
-                int16_t *samples = (int16_t *)inBuffer->mAudioData;
-                UInt32 totalSamples = inBuffer->mAudioDataByteSize / sizeof(int16_t);
-                totalSamples -= (totalSamples % (channels > 0 ? channels : 1));
-
-                if (channels == 2) {
-                    for (UInt32 i = 0; i < totalSamples; i += 2) {
-                        double sL = ((double)samples[i] / 32768.0) * preampFactor;
-                        double sR = ((double)samples[i + 1] / 32768.0) * preampFactor;
-                        for (int b = 0; b < NUM_BANDS; b++) {
-                            sL = process_L(&filters[b], sL);
-                            sR = process_R(&filters[b], sR);
-                        }
-                        samples[i]     = (int16_t)(fast_soft_clip((float)sL) * 32767.0f);
-                        samples[i + 1] = (int16_t)(fast_soft_clip((float)sR) * 32767.0f);
-                    }
-                }
-            }
+            process_pcm_raw(inBuffer->mAudioData, inBuffer->mAudioDataByteSize, format.mChannelsPerFrame, (format.mFormatFlags & kLinearPCMFormatFlagIsFloat) != 0, format.mBitsPerChannel);
+        } else {
+            process_pcm_raw(inBuffer->mAudioData, inBuffer->mAudioDataByteSize, 2, YES, 32);
         }
     }
     return orig_AudioQueueEnqueueBuffer(inAQ, inBuffer, inNumPacketDescs, inPacketDescs);
 }
 
+OSStatus my_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
+    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    if (status == noErr && ioData) {
+        process_audio_buffer_list(ioData);
+    }
+    return status;
+}
+
+OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, AudioConverterComplexInputDataProc inInputDataProc, void *inInputDataProcUserData, UInt32 *ioOutputDataPacketSize, AudioBufferList *outOutputData, AudioStreamPacketDescription *outPacketDescription) {
+    OSStatus status = orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc, inInputDataProcUserData, ioOutputDataPacketSize, outOutputData, outPacketDescription);
+    if (status == noErr && outOutputData) {
+        process_audio_buffer_list(outOutputData);
+    }
+    return status;
+}
+
+// ============================================================================
+// ИНТЕРФЕЙС
+// ============================================================================
 @interface EQManager : NSObject
 + (instancetype)shared;
 - (void)setupUI;
@@ -146,6 +218,8 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
     UISlider *_preampSlider;
     UILabel *_preampLabel;
     UIButton *_presetBtn;
+    UILabel *_statusLabel;
+    NSTimer *_statusTimer;
     UIImpactFeedbackGenerator *_hapticLight;
     UIImpactFeedbackGenerator *_hapticMedium;
 }
@@ -202,6 +276,16 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
     update_all_biquads(gCurrentSampleRate);
 }
 
+- (void)updateStatusText {
+    if (gProcessedBufferCount == 0) {
+        _statusLabel.text = @"🔴 Ожидание звука... (Включите трек)";
+        _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
+    } else {
+        _statusLabel.text = [NSString stringWithFormat:@"🟢 Активен (Обработано: %llu)", gProcessedBufferCount];
+        _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
+    }
+}
+
 - (void)setupUI {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *window = [UIApplication sharedApplication].keyWindow;
@@ -216,10 +300,6 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
         self->_toggleBtn.layer.cornerCurve = kCACornerCurveContinuous;
         self->_toggleBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:0.9].CGColor;
         self->_toggleBtn.layer.borderWidth = 1.5;
-        self->_toggleBtn.layer.shadowColor = [UIColor blackColor].CGColor;
-        self->_toggleBtn.layer.shadowOffset = CGSizeMake(0, 4);
-        self->_toggleBtn.layer.shadowOpacity = 0.35;
-        self->_toggleBtn.layer.shadowRadius = 8;
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
         [self->_toggleBtn addGestureRecognizer:pan];
@@ -230,7 +310,7 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
         CGFloat menuWidth = window.bounds.size.width - 32;
         
         self->_blurContainer = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
-        self->_blurContainer.frame = CGRectMake(16, 100, menuWidth, 490);
+        self->_blurContainer.frame = CGRectMake(16, 100, menuWidth, 510);
         self->_blurContainer.layer.cornerRadius = 22;
         self->_blurContainer.layer.cornerCurve = kCACornerCurveContinuous;
         self->_blurContainer.layer.masksToBounds = YES;
@@ -242,33 +322,43 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
 
         UIView *contentView = self->_blurContainer.contentView;
 
-        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, 130, 22)];
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, 110, 22)];
         title.text = @"Parametric EQ";
         title.textColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
-        title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+        title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
         [contentView addSubview:title];
 
         self->_presetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        self->_presetBtn.frame = CGRectMake(menuWidth - 145, 12, 70, 28);
+        self->_presetBtn.frame = CGRectMake(menuWidth - 165, 12, 65, 28);
         [self->_presetBtn setTitle:@"Presets" forState:UIControlStateNormal];
         [self->_presetBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         self->_presetBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
         self->_presetBtn.layer.cornerRadius = 8;
         self->_presetBtn.layer.cornerCurve = kCACornerCurveContinuous;
-        self->_presetBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+        self->_presetBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
         [self->_presetBtn addTarget:self action:@selector(showPresetMenu) forControlEvents:UIControlEventTouchUpInside];
         [contentView addSubview:self->_presetBtn];
 
         UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        saveBtn.frame = CGRectMake(menuWidth - 68, 12, 54, 28);
+        saveBtn.frame = CGRectMake(menuWidth - 95, 12, 50, 28);
         [saveBtn setTitle:@"Save" forState:UIControlStateNormal];
         [saveBtn setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
         saveBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
         saveBtn.layer.cornerRadius = 8;
         saveBtn.layer.cornerCurve = kCACornerCurveContinuous;
-        saveBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
+        saveBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
         [saveBtn addTarget:self action:@selector(showSavePresetAlert) forControlEvents:UIControlEventTouchUpInside];
         [contentView addSubview:saveBtn];
+
+        UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeBtn.frame = CGRectMake(menuWidth - 38, 12, 28, 28);
+        [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+        [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        closeBtn.backgroundColor = [UIColor colorWithRed:0.9 green:0.2 blue:0.2 alpha:0.8];
+        closeBtn.layer.cornerRadius = 14;
+        closeBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
+        [closeBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+        [contentView addSubview:closeBtn];
 
         UILabel *preampTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 65, 20)];
         preampTitle.text = @"Preamp:";
@@ -295,7 +385,7 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
         line.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
         [contentView addSubview:line];
 
-        UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 82, menuWidth - 16, 395)];
+        UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 82, menuWidth - 16, 380)];
         scroll.showsVerticalScrollIndicator = NO;
         [contentView addSubview:scroll];
 
@@ -351,6 +441,18 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
         }
 
         scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 10);
+
+        UIView *line2 = [[UIView alloc] initWithFrame:CGRectMake(16, 470, menuWidth - 32, 0.5)];
+        line2.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
+        [contentView addSubview:line2];
+
+        self->_statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 478, menuWidth - 32, 20)];
+        self->_statusLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+        self->_statusLabel.textAlignment = NSTextAlignmentCenter;
+        [self updateStatusText];
+        [contentView addSubview:self->_statusLabel];
+
+        self->_statusTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateStatusText) userInfo:nil repeats:YES];
     });
 }
 
@@ -520,11 +622,23 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
 @end
 
 __attribute__((constructor))
-static void init_eq_tweak() {
+static void init_eq_tweak(void) {
     [[EQManager shared] loadSettings];
-    rebind_symbols((struct rebinding[1]){
-        {"AudioQueueEnqueueBuffer", (void *)my_AudioQueueEnqueueBuffer, (void **)&orig_AudioQueueEnqueueBuffer}
-    }, 1);
+    
+    struct rebinding rebinds[3];
+    rebinds[0].name = "AudioQueueEnqueueBuffer";
+    rebinds[0].replacement = (void *)(uintptr_t)my_AudioQueueEnqueueBuffer;
+    rebinds[0].replaced = (void **)(uintptr_t)&orig_AudioQueueEnqueueBuffer;
+
+    rebinds[1].name = "AudioUnitRender";
+    rebinds[1].replacement = (void *)(uintptr_t)my_AudioUnitRender;
+    rebinds[1].replaced = (void **)(uintptr_t)&orig_AudioUnitRender;
+
+    rebinds[2].name = "AudioConverterFillComplexBuffer";
+    rebinds[2].replacement = (void *)(uintptr_t)my_AudioConverterFillComplexBuffer;
+    rebinds[2].replaced = (void **)(uintptr_t)&orig_AudioConverterFillComplexBuffer;
+    
+    rebind_symbols(rebinds, 3);
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
         [[EQManager shared] setupUI];
