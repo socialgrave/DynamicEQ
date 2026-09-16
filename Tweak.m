@@ -18,9 +18,9 @@ static BOOL gEQEnabled = YES;
 static uint64_t gProcessedBufferCount = 0;
 static float gLivePeakLevel = 0.0f;
 
-static double gLastAudioTime = 0.0;
-static int gFadeInCounter = 0;
-#define FADE_IN_SAMPLES 400
+// Защита от повторной обработки одного и того же буфера
+static void *gLastBufferPtr = NULL;
+static UInt32 gLastBufferSize = 0;
 
 typedef struct {
     double b0, b1, b2, a1, a2;
@@ -31,23 +31,13 @@ typedef struct {
 static BiquadFilter64 filters[NUM_BANDS];
 static double gCurrentSampleRate = 44100.0;
 
-// Безопасный сатуратор с жестким ограничением граничных значений
 static inline float tape_saturate(double x) {
     if (isnan(x) || isinf(x)) return 0.0f;
-    if (x > 3.0) return 0.99f;
-    if (x < -3.0) return -0.99f;
     return (float)tanh(x * 0.65);
 }
 
 static inline double kill_denormal(double val) {
     return (fabs(val) < 1.0e-15) ? 0.0 : val;
-}
-
-static void reset_all_filter_mem(void) {
-    for (int i = 0; i < NUM_BANDS; i++) {
-        filters[i].x1_L = filters[i].x2_L = filters[i].y1_L = filters[i].y2_L = 0.0;
-        filters[i].x1_R = filters[i].x2_R = filters[i].y1_R = filters[i].y2_R = 0.0;
-    }
 }
 
 static void init_low_shelf(BiquadFilter64 *f, double freq, double gainDb, double sampleRate) {
@@ -80,7 +70,7 @@ static void init_high_shelf(BiquadFilter64 *f, double freq, double gainDb, doubl
 
     double b0 = A * ((A + 1.0) + (A - 1.0)*cos_w0 + beta);
     double b1 = -2.0 * A * ((A - 1.0) + (A + 1.0)*cos_w0);
-    double b2 = A * ((A + 1.0) + (A - 1.0)*cos_w0 - beta);
+    double b2 = A * ((A + 1.0) - (A - 1.0)*cos_w0 - beta);
     double a0 = (A + 1.0) - (A - 1.0)*cos_w0 + beta;
     double a1 = 2.0 * ((A - 1.0) - (A + 1.0)*cos_w0);
     double a2 = (A + 1.0) - (A - 1.0)*cos_w0 - beta;
@@ -120,16 +110,10 @@ static void update_all_biquads(double sampleRate) {
     for (int i = 0; i < NUM_BANDS; i++) {
         update_biquad_single(i, sampleRate);
     }
-    reset_all_filter_mem();
 }
 
-// Процессинг каналов с защитой от выбросов (Spike Guard)
 static inline double process_L(BiquadFilter64 *f, double inSample) {
     double out = f->b0 * inSample + f->b1 * f->x1_L + f->b2 * f->x2_L - f->a1 * f->y1_L - f->a2 * f->y2_L;
-    if (fabs(out) > 4.0 || isnan(out)) { // Ловушка аномальных выбросов
-        f->x1_L = f->x2_L = f->y1_L = f->y2_L = 0.0;
-        return 0.0;
-    }
     f->x2_L = f->x1_L; f->x1_L = inSample;
     f->y2_L = kill_denormal(f->y1_L); f->y1_L = kill_denormal(out);
     return out;
@@ -137,29 +121,22 @@ static inline double process_L(BiquadFilter64 *f, double inSample) {
 
 static inline double process_R(BiquadFilter64 *f, double inSample) {
     double out = f->b0 * inSample + f->b1 * f->x1_R + f->b2 * f->x2_R - f->a1 * f->y1_R - f->a2 * f->y2_R;
-    if (fabs(out) > 4.0 || isnan(out)) { // Ловушка аномальных выбросов
-        f->x1_R = f->x2_R = f->y1_R = f->y2_R = 0.0;
-        return 0.0;
-    }
     f->x2_R = f->x1_R; f->x1_R = inSample;
     f->y2_R = kill_denormal(f->y1_R); f->y1_R = kill_denormal(out);
     return out;
 }
 
-static void check_stream_gap(void) {
-    double now = CACurrentMediaTime();
-    if (now - gLastAudioTime > 0.20) {
-        reset_all_filter_mem();
-        gFadeInCounter = 0;
-    }
-    gLastAudioTime = now;
-}
-
 static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL isFloat, UInt32 bitsPerChannel) {
     if (!data || byteSize == 0) return;
-    check_stream_gap();
-    gProcessedBufferCount++;
+    
+    // Предотвращение повторной обработки того же самого буфера памяти
+    if (data == gLastBufferPtr && byteSize == gLastBufferSize) {
+        return;
+    }
+    gLastBufferPtr = data;
+    gLastBufferSize = byteSize;
 
+    gProcessedBufferCount++;
     if (!gEQEnabled) return;
 
     double preampFactor = pow(10.0, PREAMP_DB / 20.0);
@@ -172,14 +149,8 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
         if (channels >= 2) {
             for (UInt32 i = 0; i < totalSamples; i += channels) {
-                double ramp = 1.0;
-                if (gFadeInCounter < FADE_IN_SAMPLES) {
-                    ramp = (double)gFadeInCounter / (double)FADE_IN_SAMPLES;
-                    gFadeInCounter++;
-                }
-
-                double sL = (double)samples[i] * preampFactor * ramp;
-                double sR = (double)samples[i + 1] * preampFactor * ramp;
+                double sL = (double)samples[i] * preampFactor;
+                double sR = (double)samples[i + 1] * preampFactor;
                 for (int b = 0; b < NUM_BANDS; b++) {
                     sL = process_L(&filters[b], sL);
                     sR = process_R(&filters[b], sR);
@@ -198,14 +169,8 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
         if (channels >= 2) {
             for (UInt32 i = 0; i < totalSamples; i += channels) {
-                double ramp = 1.0;
-                if (gFadeInCounter < FADE_IN_SAMPLES) {
-                    ramp = (double)gFadeInCounter / (double)FADE_IN_SAMPLES;
-                    gFadeInCounter++;
-                }
-
-                double sL = ((double)samples[i] / 32768.0) * preampFactor * ramp;
-                double sR = ((double)samples[i + 1] / 32768.0) * preampFactor * ramp;
+                double sL = ((double)samples[i] / 32768.0) * preampFactor;
+                double sR = ((double)samples[i + 1] / 32768.0) * preampFactor;
                 for (int b = 0; b < NUM_BANDS; b++) {
                     sL = process_L(&filters[b], sL);
                     sR = process_R(&filters[b], sR);
@@ -223,40 +188,36 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
 
 static void process_audio_buffer_list(AudioBufferList *ioData) {
     if (!ioData || ioData->mNumberBuffers == 0) return;
-    check_stream_gap();
-    if (!gEQEnabled) { gProcessedBufferCount++; return; }
-
-    double preampFactor = pow(10.0, PREAMP_DB / 20.0);
-    float maxPeak = 0.0f;
-
+    
     if (ioData->mNumberBuffers == 2) {
-        gProcessedBufferCount++;
         float *samplesL = (float *)ioData->mBuffers[0].mData;
         float *samplesR = (float *)ioData->mBuffers[1].mData;
+        if (!samplesL || !samplesR) return;
+
+        if (samplesL == gLastBufferPtr) return;
+        gLastBufferPtr = samplesL;
+
+        gProcessedBufferCount++;
+        if (!gEQEnabled) return;
+
+        double preampFactor = pow(10.0, PREAMP_DB / 20.0);
+        float maxPeak = 0.0f;
         UInt32 totalSamples = ioData->mBuffers[0].mDataByteSize / sizeof(float);
 
-        if (samplesL && samplesR) {
-            for (UInt32 i = 0; i < totalSamples; i++) {
-                double ramp = 1.0;
-                if (gFadeInCounter < FADE_IN_SAMPLES) {
-                    ramp = (double)gFadeInCounter / (double)FADE_IN_SAMPLES;
-                    gFadeInCounter++;
-                }
+        for (UInt32 i = 0; i < totalSamples; i++) {
+            double sL = (double)samplesL[i] * preampFactor;
+            double sR = (double)samplesR[i] * preampFactor;
 
-                double sL = (double)samplesL[i] * preampFactor * ramp;
-                double sR = (double)samplesR[i] * preampFactor * ramp;
-
-                for (int b = 0; b < NUM_BANDS; b++) {
-                    sL = process_L(&filters[b], sL);
-                    sR = process_R(&filters[b], sR);
-                }
-
-                float outL = tape_saturate(sL);
-                float outR = tape_saturate(sR);
-                samplesL[i] = outL;
-                samplesR[i] = outR;
-                if (fabsf(outL) > maxPeak) maxPeak = fabsf(outL);
+            for (int b = 0; b < NUM_BANDS; b++) {
+                sL = process_L(&filters[b], sL);
+                sR = process_R(&filters[b], sR);
             }
+
+            float outL = tape_saturate(sL);
+            float outR = tape_saturate(sR);
+            samplesL[i] = outL;
+            samplesR[i] = outR;
+            if (fabsf(outL) > maxPeak) maxPeak = fabsf(outL);
         }
         gLivePeakLevel = maxPeak;
     } else if (ioData->mNumberBuffers == 1) {
@@ -267,7 +228,6 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
 
 static OSStatus (*orig_AudioQueueEnqueueBuffer)(AudioQueueRef, AudioQueueBufferRef, UInt32, const AudioStreamPacketDescription *);
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
-static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef, AudioConverterComplexInputDataProc, void *, UInt32 *, AudioBufferList *, AudioStreamPacketDescription *);
 
 OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, UInt32 inNumPacketDescs, const AudioStreamPacketDescription *inPacketDescs) {
     if (inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0) {
@@ -293,14 +253,6 @@ OSStatus my_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActi
     OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (status == noErr && ioData) {
         process_audio_buffer_list(ioData);
-    }
-    return status;
-}
-
-OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, AudioConverterComplexInputDataProc inInputDataProc, void *inInputDataProcUserData, UInt32 *ioOutputDataPacketSize, AudioBufferList *outOutputData, AudioStreamPacketDescription *outPacketDescription) {
-    OSStatus status = orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc, inInputDataProcUserData, ioOutputDataPacketSize, outOutputData, outPacketDescription);
-    if (status == noErr && outOutputData) {
-        process_audio_buffer_list(outOutputData);
     }
     return status;
 }
@@ -404,7 +356,7 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
         _vuMeter.progress = 0.0f;
     } else {
-        _statusLabel.text = [NSString stringWithFormat:@"⚡ 10-Band Tape-DSP (%llu buf)", gProcessedBufferCount];
+        _statusLabel.text = [NSString stringWithFormat:@"⚡ CleanStream DSP v1.2 (%llu buf)", gProcessedBufferCount];
         _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
         _vuMeter.progress = gLivePeakLevel;
         _vuMeter.progressTintColor = (gLivePeakLevel > 0.95f) ? [UIColor redColor] : [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
@@ -817,7 +769,7 @@ __attribute__((constructor))
 static void init_eq_tweak(void) {
     [[EQManager shared] loadSettings];
     
-    struct rebinding rebinds[3];
+    struct rebinding rebinds[2];
     rebinds[0].name = "AudioQueueEnqueueBuffer";
     rebinds[0].replacement = (void *)(uintptr_t)my_AudioQueueEnqueueBuffer;
     rebinds[0].replaced = (void **)(uintptr_t)&orig_AudioQueueEnqueueBuffer;
@@ -825,12 +777,8 @@ static void init_eq_tweak(void) {
     rebinds[1].name = "AudioUnitRender";
     rebinds[1].replacement = (void *)(uintptr_t)my_AudioUnitRender;
     rebinds[1].replaced = (void **)(uintptr_t)&orig_AudioUnitRender;
-
-    rebinds[2].name = "AudioConverterFillComplexBuffer";
-    rebinds[2].replacement = (void *)(uintptr_t)my_AudioConverterFillComplexBuffer;
-    rebinds[2].replaced = (void **)(uintptr_t)&orig_AudioConverterFillComplexBuffer;
     
-    rebind_symbols(rebinds, 3);
+    rebind_symbols(rebinds, 2);
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
         [[EQManager shared] setupUI];
