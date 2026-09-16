@@ -18,9 +18,8 @@ static BOOL gEQEnabled = YES;
 static uint64_t gProcessedBufferCount = 0;
 static float gLivePeakLevel = 0.0f;
 
-// Защита от повторной обработки одного и того же буфера
-static void *gLastBufferPtr = NULL;
-static UInt32 gLastBufferSize = 0;
+// Потоковый предохранитель повторной обработки (Thread-Local Reentrancy Guard)
+static __thread BOOL gInHook = NO;
 
 typedef struct {
     double b0, b1, b2, a1, a2;
@@ -128,13 +127,6 @@ static inline double process_R(BiquadFilter64 *f, double inSample) {
 
 static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL isFloat, UInt32 bitsPerChannel) {
     if (!data || byteSize == 0) return;
-    
-    // Предотвращение повторной обработки того же самого буфера памяти
-    if (data == gLastBufferPtr && byteSize == gLastBufferSize) {
-        return;
-    }
-    gLastBufferPtr = data;
-    gLastBufferSize = byteSize;
 
     gProcessedBufferCount++;
     if (!gEQEnabled) return;
@@ -194,9 +186,6 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
         float *samplesR = (float *)ioData->mBuffers[1].mData;
         if (!samplesL || !samplesR) return;
 
-        if (samplesL == gLastBufferPtr) return;
-        gLastBufferPtr = samplesL;
-
         gProcessedBufferCount++;
         if (!gEQEnabled) return;
 
@@ -228,8 +217,12 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
 
 static OSStatus (*orig_AudioQueueEnqueueBuffer)(AudioQueueRef, AudioQueueBufferRef, UInt32, const AudioStreamPacketDescription *);
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef, AudioConverterComplexInputDataProc, void *, UInt32 *, AudioBufferList *, AudioStreamPacketDescription *);
 
 OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, UInt32 inNumPacketDescs, const AudioStreamPacketDescription *inPacketDescs) {
+    if (gInHook) return orig_AudioQueueEnqueueBuffer(inAQ, inBuffer, inNumPacketDescs, inPacketDescs);
+    gInHook = YES;
+
     if (inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0) {
         AudioStreamBasicDescription format;
         UInt32 propSize = sizeof(format);
@@ -246,14 +239,35 @@ OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBu
             process_pcm_raw(inBuffer->mAudioData, inBuffer->mAudioDataByteSize, 2, YES, 32);
         }
     }
-    return orig_AudioQueueEnqueueBuffer(inAQ, inBuffer, inNumPacketDescs, inPacketDescs);
+
+    OSStatus res = orig_AudioQueueEnqueueBuffer(inAQ, inBuffer, inNumPacketDescs, inPacketDescs);
+    gInHook = NO;
+    return res;
 }
 
 OSStatus my_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
+    if (gInHook) return orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    gInHook = YES;
+
     OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (status == noErr && ioData) {
         process_audio_buffer_list(ioData);
     }
+
+    gInHook = NO;
+    return status;
+}
+
+OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, AudioConverterComplexInputDataProc inInputDataProc, void *inInputDataProcUserData, UInt32 *ioOutputDataPacketSize, AudioBufferList *outOutputData, AudioStreamPacketDescription *outPacketDescription) {
+    if (gInHook) return orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc, inInputDataProcUserData, ioOutputDataPacketSize, outOutputData, outPacketDescription);
+    gInHook = YES;
+
+    OSStatus status = orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc, inInputDataProcUserData, ioOutputDataPacketSize, outOutputData, outPacketDescription);
+    if (status == noErr && outOutputData) {
+        process_audio_buffer_list(outOutputData);
+    }
+
+    gInHook = NO;
     return status;
 }
 
@@ -356,7 +370,7 @@ OSStatus my_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActi
         _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
         _vuMeter.progress = 0.0f;
     } else {
-        _statusLabel.text = [NSString stringWithFormat:@"⚡ CleanStream DSP v1.2 (%llu buf)", gProcessedBufferCount];
+        _statusLabel.text = [NSString stringWithFormat:@"⚡ Tape-DSP v1.3 (%llu buf)", gProcessedBufferCount];
         _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
         _vuMeter.progress = gLivePeakLevel;
         _vuMeter.progressTintColor = (gLivePeakLevel > 0.95f) ? [UIColor redColor] : [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
@@ -769,7 +783,7 @@ __attribute__((constructor))
 static void init_eq_tweak(void) {
     [[EQManager shared] loadSettings];
     
-    struct rebinding rebinds[2];
+    struct rebinding rebinds[3];
     rebinds[0].name = "AudioQueueEnqueueBuffer";
     rebinds[0].replacement = (void *)(uintptr_t)my_AudioQueueEnqueueBuffer;
     rebinds[0].replaced = (void **)(uintptr_t)&orig_AudioQueueEnqueueBuffer;
@@ -777,8 +791,12 @@ static void init_eq_tweak(void) {
     rebinds[1].name = "AudioUnitRender";
     rebinds[1].replacement = (void *)(uintptr_t)my_AudioUnitRender;
     rebinds[1].replaced = (void **)(uintptr_t)&orig_AudioUnitRender;
+
+    rebinds[2].name = "AudioConverterFillComplexBuffer";
+    rebinds[2].replacement = (void *)(uintptr_t)my_AudioConverterFillComplexBuffer;
+    rebinds[2].replaced = (void **)(uintptr_t)&orig_AudioConverterFillComplexBuffer;
     
-    rebind_symbols(rebinds, 2);
+    rebind_symbols(rebinds, 3);
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
         [[EQManager shared] setupUI];
