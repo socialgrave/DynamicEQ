@@ -1,0 +1,28 @@
+name: Build DynamicEQ Dylib
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Fetch Fishhook
+      run: |
+        curl -sL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c -o fishhook.c
+        curl -sL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h -o fishhook.h
+
+    - name: Compile Dylib
+      run: |
+        clang -dynamiclib -O3 \
+        -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+        -arch arm64 -miphoneos-version-min=14.0 \
+        -framework AudioToolbox -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore \
+        Tweak.m fishhook.c -o DynamicEQ.dylib
+
+    - name: Upload Dylib
+      uses: actions/upload-artifact@v3
+      with:
+        name: DynamicEQ.dylib
+        path: DynamicEQ.dylib
