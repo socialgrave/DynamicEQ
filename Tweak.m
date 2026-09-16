@@ -10,10 +10,10 @@
 #endif
 
 #define NUM_BANDS 7
-static double FREQUENCIES[NUM_BANDS] = {70.0, 35.0, 60.0, 100.0, 250.0, 500.0, 1000.0}; // Band 0 is Low-Shelf Cutoff at 70Hz
-static double default_gains[NUM_BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0}; // 3D Subwoofer preset
+static double FREQUENCIES[NUM_BANDS] = {45.0, 30.0, 60.0, 100.0, 250.0, 500.0, 1000.0}; // Band 0 is Ultra-Sub Shelf at 45Hz
+static double default_gains[NUM_BANDS] = {12.0, 6.0, 2.0, -3.0, -5.0, 0.0, 1.5}; // EarthQuake preset
 static double GAINS_DB[NUM_BANDS];
-static double PREAMP_DB = -5.0;
+static double PREAMP_DB = -7.0;
 static uint64_t gProcessedBufferCount = 0;
 
 typedef struct {
@@ -35,7 +35,6 @@ static inline double kill_denormal(double val) {
     return (fabs(val) < 1.0e-15) ? 0.0 : val;
 }
 
-// Low-Shelf Filter for Deep Sub-Bass (Band 0)
 static void init_low_shelf(BiquadFilter64 *f, double freq, double gainDb, double sampleRate) {
     if (fabs(gainDb) < 0.01) {
         f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
@@ -59,7 +58,6 @@ static void init_low_shelf(BiquadFilter64 *f, double freq, double gainDb, double
     f->a1 = a1 / a0; f->a2 = a2 / a0;
 }
 
-// Peaking Filter for other bands
 static void init_peaking(BiquadFilter64 *f, double freq, double gainDb, double sampleRate, double Q) {
     if (fabs(gainDb) < 0.01) {
         f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
@@ -191,9 +189,6 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
     }
 }
 
-// ============================================================================
-// ХУКИ
-// ============================================================================
 static OSStatus (*orig_AudioQueueEnqueueBuffer)(AudioQueueRef, AudioQueueBufferRef, UInt32, const AudioStreamPacketDescription *);
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
 static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef, AudioConverterComplexInputDataProc, void *, UInt32 *, AudioBufferList *, AudioStreamPacketDescription *);
@@ -234,9 +229,6 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
     return status;
 }
 
-// ============================================================================
-// ИНТЕРФЕЙС
-// ============================================================================
 @interface EQManager : NSObject
 + (instancetype)shared;
 - (void)setupUI;
@@ -313,7 +305,7 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         _statusLabel.text = @"🔴 Ожидание звука... (Включите трек)";
         _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
     } else {
-        _statusLabel.text = [NSString stringWithFormat:@"🟢 3D Sub DSP Active (%llu buf)", gProcessedBufferCount];
+        _statusLabel.text = [NSString stringWithFormat:@"⚡ EarthQuake Sub DSP (%llu buf)", gProcessedBufferCount];
         _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
     }
 }
@@ -599,17 +591,17 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         [self applyGainsAndRefreshUI];
     }]];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🔊 3D Subwoofer (Глубокий гул)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double sub_gains[NUM_BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0};
+    [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ EarthQuake 20-40Hz (Макс. Глубина)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double sub_gains[NUM_BANDS] = {12.0, 6.0, 2.0, -3.0, -5.0, 0.0, 1.5};
         for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = sub_gains[i];
-        PREAMP_DB = -5.0;
+        PREAMP_DB = -7.0;
         [self applyGainsAndRefreshUI];
     }]];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🎧 Club Punch (Плотный кач)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double club_gains[NUM_BANDS] = {6.0, 8.0, 6.0, 2.0, -3.0, 0.0, 2.0};
-        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = club_gains[i];
-        PREAMP_DB = -6.0;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🎧 Deep Pressure (Мягкий глубокий басс)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double deep_gains[NUM_BANDS] = {9.0, 8.0, 3.0, -2.0, -4.0, 0.0, 1.0};
+        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = deep_gains[i];
+        PREAMP_DB = -5.5;
         [self applyGainsAndRefreshUI];
     }]];
 
