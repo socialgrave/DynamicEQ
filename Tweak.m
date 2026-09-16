@@ -10,10 +10,10 @@
 #endif
 
 #define NUM_BANDS 7
-static double FREQUENCIES[NUM_BANDS] = {45.0, 30.0, 60.0, 100.0, 250.0, 500.0, 1000.0}; // Band 0 is Ultra-Sub Shelf at 45Hz
-static double default_gains[NUM_BANDS] = {12.0, 6.0, 2.0, -3.0, -5.0, 0.0, 1.5}; // EarthQuake preset
+static double FREQUENCIES[NUM_BANDS] = {55.0, 35.0, 65.0, 110.0, 250.0, 500.0, 1000.0};
+static double default_gains[NUM_BANDS] = {18.0, 12.0, 5.0, -2.0, -6.0, 0.0, 1.0};
 static double GAINS_DB[NUM_BANDS];
-static double PREAMP_DB = -7.0;
+static double PREAMP_DB = -10.0;
 static uint64_t gProcessedBufferCount = 0;
 
 typedef struct {
@@ -25,10 +25,10 @@ typedef struct {
 static BiquadFilter64 filters[NUM_BANDS];
 static double gCurrentSampleRate = 44100.0;
 
-static inline float fast_soft_clip(float x) {
-    if (x > 1.2f) return 0.99f;
-    if (x < -1.2f) return -0.99f;
-    return x - (x * x * x) * 0.16666667f;
+// Гладкий аналоговый сатуратор (Zero Discontinuity / Без прострелов)
+static inline float tape_saturate(double x) {
+    if (isnan(x) || isinf(x)) return 0.0f;
+    return (float)tanh(x * 0.65);
 }
 
 static inline double kill_denormal(double val) {
@@ -83,7 +83,7 @@ static void update_biquad_single(int i, double sampleRate) {
     if (i == 0) {
         init_low_shelf(&filters[0], FREQUENCIES[0], GAINS_DB[0], sampleRate);
     } else {
-        init_peaking(&filters[i], FREQUENCIES[i], GAINS_DB[i], sampleRate, 1.30);
+        init_peaking(&filters[i], FREQUENCIES[i], GAINS_DB[i], sampleRate, 1.10);
     }
 }
 
@@ -127,8 +127,8 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
                     sL = process_L(&filters[b], sL);
                     sR = process_R(&filters[b], sR);
                 }
-                samples[i]     = fast_soft_clip((float)sL);
-                samples[i + 1] = fast_soft_clip((float)sR);
+                samples[i]     = tape_saturate(sL);
+                samples[i + 1] = tape_saturate(sR);
             }
         } else if (channels == 1) {
             for (UInt32 i = 0; i < totalSamples; i++) {
@@ -136,7 +136,7 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
                 for (int b = 0; b < NUM_BANDS; b++) {
                     sL = process_L(&filters[b], sL);
                 }
-                samples[i] = fast_soft_clip((float)sL);
+                samples[i] = tape_saturate(sL);
             }
         }
     } else if (bitsPerChannel == 16) {
@@ -152,8 +152,8 @@ static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL i
                     sL = process_L(&filters[b], sL);
                     sR = process_R(&filters[b], sR);
                 }
-                samples[i]     = (int16_t)(fast_soft_clip((float)sL) * 32767.0f);
-                samples[i + 1] = (int16_t)(fast_soft_clip((float)sR) * 32767.0f);
+                samples[i]     = (int16_t)(tape_saturate(sL) * 32767.0f);
+                samples[i + 1] = (int16_t)(tape_saturate(sR) * 32767.0f);
             }
         }
     }
@@ -179,8 +179,8 @@ static void process_audio_buffer_list(AudioBufferList *ioData) {
                     sR = process_R(&filters[b], sR);
                 }
 
-                samplesL[i] = fast_soft_clip((float)sL);
-                samplesR[i] = fast_soft_clip((float)sR);
+                samplesL[i] = tape_saturate(sL);
+                samplesR[i] = tape_saturate(sR);
             }
         }
     } else if (ioData->mNumberBuffers == 1) {
@@ -305,7 +305,7 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         _statusLabel.text = @"🔴 Ожидание звука... (Включите трек)";
         _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
     } else {
-        _statusLabel.text = [NSString stringWithFormat:@"⚡ EarthQuake Sub DSP (%llu buf)", gProcessedBufferCount];
+        _statusLabel.text = [NSString stringWithFormat:@"💀 BassCannon Tape-DSP (%llu buf)", gProcessedBufferCount];
         _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
     }
 }
@@ -391,8 +391,8 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         [contentView addSubview:preampTitle];
 
         self->_preampSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 48, menuWidth - 155, 20)];
-        self->_preampSlider.minimumValue = -12.0;
-        self->_preampSlider.maximumValue = 0.0;
+        self->_preampSlider.minimumValue = -18.0;
+        self->_preampSlider.maximumValue = +6.0;
         self->_preampSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
         self->_preampSlider.value = PREAMP_DB;
         [self->_preampSlider addTarget:self action:@selector(preampChanged:) forControlEvents:UIControlEventValueChanged];
@@ -433,8 +433,8 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
             [scroll addSubview:minusBtn];
 
             UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(96, y, scroll.bounds.size.width - 198, 26)];
-            slider.minimumValue = -15.0;
-            slider.maximumValue = +15.0;
+            slider.minimumValue = -24.0;
+            slider.maximumValue = +24.0;
             slider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
             slider.value = GAINS_DB[i];
             slider.tag = i;
@@ -525,7 +525,7 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
     [self triggerHaptic:0];
     int idx = (int)btn.tag;
     float val = _sliders[idx].value - 0.5f;
-    if (val < -15.0f) val = -15.0f;
+    if (val < -24.0f) val = -24.0f;
     _sliders[idx].value = val;
     [self sliderChanged:_sliders[idx]];
 }
@@ -534,7 +534,7 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
     [self triggerHaptic:0];
     int idx = (int)btn.tag;
     float val = _sliders[idx].value + 0.5f;
-    if (val > 15.0f) val = 15.0f;
+    if (val > 24.0f) val = 24.0f;
     _sliders[idx].value = val;
     [self sliderChanged:_sliders[idx]];
 }
@@ -591,17 +591,17 @@ OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, 
         [self applyGainsAndRefreshUI];
     }]];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ EarthQuake 20-40Hz (Макс. Глубина)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double sub_gains[NUM_BANDS] = {12.0, 6.0, 2.0, -3.0, -5.0, 0.0, 1.5};
+    [sheet addAction:[UIAlertAction actionWithTitle:@"💀 BassCannon (Ear Shaker)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double sub_gains[NUM_BANDS] = {18.0, 12.0, 5.0, -2.0, -6.0, 0.0, 1.0};
         for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = sub_gains[i];
-        PREAMP_DB = -7.0;
+        PREAMP_DB = -10.0;
         [self applyGainsAndRefreshUI];
     }]];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🎧 Deep Pressure (Мягкий глубокий басс)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double deep_gains[NUM_BANDS] = {9.0, 8.0, 3.0, -2.0, -4.0, 0.0, 1.0};
-        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = deep_gains[i];
-        PREAMP_DB = -5.5;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ EarthQuake 20-40Hz" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double sub_gains[NUM_BANDS] = {14.0, 8.0, 3.0, -3.0, -5.0, 0.0, 1.5};
+        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = sub_gains[i];
+        PREAMP_DB = -7.5;
         [self applyGainsAndRefreshUI];
     }]];
 
