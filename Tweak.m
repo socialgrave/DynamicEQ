@@ -1,742 +1,561 @@
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import <math.h>
-#import <stdatomic.h>
 #include "fishhook.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-#define NUM_BANDS 7
-static double FREQUENCIES[NUM_BANDS] = {50.0, 80.0, 160.0, 400.0, 1000.0, 2500.0, 6000.0};
-static double default_gains[NUM_BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0};
-static double GAINS_DB[NUM_BANDS];
-static double PREAMP_DB = -5.0;
-static uint64_t gProcessedBufferCount = 0;
-static _Atomic BOOL gIsUpdatingFilters = NO;
+#define BANDS 7
+
+static double FREQS[BANDS] = {50.0, 80.0, 160.0, 400.0, 1000.0, 2500.0, 6000.0};
+static double DEFAULT_GAINS[BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0};
+static double gGains[BANDS];
+static double gPreamp = -5.0;
+static uint64_t gBufCount = 0;
+static double gSampleRate = 44100.0;
 
 typedef struct {
     double b0, b1, b2, a1, a2;
     double x1_L, x2_L, y1_L, y2_L;
     double x1_R, x2_R, y1_R, y2_R;
-} BiquadFilter64;
+} Biquad;
 
-static BiquadFilter64 filters[NUM_BANDS];
-static double gCurrentSampleRate = 44100.0;
+static Biquad gFilters[BANDS];
 
-static inline float fast_soft_clip(float x) {
+static inline float soft_clip(float x) {
     if (x > 1.2f) return 0.99f;
     if (x < -1.2f) return -0.99f;
     return x - (x * x * x) * 0.16666667f;
 }
 
-static inline double kill_denormal(double val) {
-    return (fabs(val) < 1.0e-15) ? 0.0 : val;
+static inline double kill_denormal(double v) {
+    return (fabs(v) < 1.0e-15) ? 0.0 : v;
 }
 
-static void init_low_shelf(BiquadFilter64 *f, double freq, double gainDb, double sampleRate) {
-    if (fabs(gainDb) < 0.01) {
-        f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
-        return;
-    }
-    double A = pow(10.0, gainDb / 40.0);
-    double w0 = 2.0 * M_PI * freq / sampleRate;
-    double cos_w0 = cos(w0);
-    double sin_w0 = sin(w0);
-    double alpha = sin_w0 / 2.0 * sqrt((A + 1.0/A)*(1.0/0.707 - 1.0) + 2.0);
+static void set_low_shelf(Biquad *f, double freq, double gain, double sr) {
+    if (fabs(gain) < 0.01) { f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0; return; }
+    double A = pow(10.0, gain / 40.0);
+    double w0 = 2.0 * M_PI * freq / sr;
+    double cw = cos(w0), sw = sin(w0);
+    double alpha = sw / 2.0 * sqrt((A + 1.0 / A) * (1.0 / 0.707 - 1.0) + 2.0);
     double beta = 2.0 * sqrt(A) * alpha;
 
-    double b0 = A * ((A + 1.0) - (A - 1.0)*cos_w0 + beta);
-    double b1 = 2.0 * A * ((A - 1.0) - (A + 1.0)*cos_w0);
-    double b2 = A * ((A + 1.0) - (A - 1.0)*cos_w0 - beta);
-    double a0 = (A + 1.0) + (A - 1.0)*cos_w0 + beta;
-    double a1 = -2.0 * ((A - 1.0) + (A + 1.0)*cos_w0);
-    double a2 = (A + 1.0) + (A - 1.0)*cos_w0 - beta;
-
-    f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0;
-    f->a1 = a1 / a0; f->a2 = a2 / a0;
+    double a0 = (A + 1.0) + (A - 1.0) * cw + beta;
+    f->b0 = (A * ((A + 1.0) - (A - 1.0) * cw + beta)) / a0;
+    f->b1 = (2.0 * A * ((A - 1.0) - (A + 1.0) * cw)) / a0;
+    f->b2 = (A * ((A + 1.0) - (A - 1.0) * cw - beta)) / a0;
+    f->a1 = (-2.0 * ((A - 1.0) + (A + 1.0) * cw)) / a0;
+    f->a2 = ((A + 1.0) + (A - 1.0) * cw - beta) / a0;
 }
 
-static void init_peaking(BiquadFilter64 *f, double freq, double gainDb, double sampleRate, double Q) {
-    if (fabs(gainDb) < 0.01) {
-        f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
-        return;
-    }
-    double A = pow(10.0, gainDb / 40.0);
-    double omega = 2.0 * M_PI * freq / sampleRate;
-    double alpha = sin(omega) / (2.0 * Q);
-    double cos_w = cos(omega);
+static void set_peaking(Biquad *f, double freq, double gain, double sr, double Q) {
+    if (fabs(gain) < 0.01) { f->b0 = 1.0; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0; return; }
+    double A = pow(10.0, gain / 40.0);
+    double w = 2.0 * M_PI * freq / sr;
+    double alpha = sin(w) / (2.0 * Q);
+    double cw = cos(w);
 
-    double b0 = 1.0 + alpha * A;
-    double b1 = -2.0 * cos_w;
-    double b2 = 1.0 - alpha * A;
     double a0 = 1.0 + alpha / A;
-    double a1 = -2.0 * cos_w;
-    double a2 = 1.0 - alpha / A;
-
-    f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0;
-    f->a1 = a1 / a0; f->a2 = a2 / a0;
+    f->b0 = (1.0 + alpha * A) / a0;
+    f->b1 = (-2.0 * cw) / a0;
+    f->b2 = (1.0 - alpha * A) / a0;
+    f->a1 = (-2.0 * cw) / a0;
+    f->a2 = (1.0 - alpha / A) / a0;
 }
 
-static void update_biquad_single(int i, double sampleRate) {
-    atomic_store(&gIsUpdatingFilters, YES);
-    if (i == 0) {
-        init_low_shelf(&filters[0], FREQUENCIES[0], GAINS_DB[0], sampleRate);
-    } else {
-        init_peaking(&filters[i], FREQUENCIES[i], GAINS_DB[i], sampleRate, 1.30);
-    }
-    atomic_store(&gIsUpdatingFilters, NO);
+static void update_filter(int i, double sr) {
+    if (i == 0) set_low_shelf(&gFilters[0], FREQS[0], gGains[0], sr);
+    else set_peaking(&gFilters[i], FREQS[i], gGains[i], sr, 1.30);
 }
 
-static void update_all_biquads(double sampleRate) {
-    atomic_store(&gIsUpdatingFilters, YES);
-    gCurrentSampleRate = sampleRate;
-    for (int i = 0; i < NUM_BANDS; i++) {
-        if (i == 0) {
-            init_low_shelf(&filters[0], FREQUENCIES[0], GAINS_DB[0], sampleRate);
-        } else {
-            init_peaking(&filters[i], FREQUENCIES[i], GAINS_DB[i], sampleRate, 1.30);
-        }
-    }
-    atomic_store(&gIsUpdatingFilters, NO);
+static void update_all_filters(double sr) {
+    gSampleRate = sr;
+    for (int i = 0; i < BANDS; i++) update_filter(i, sr);
 }
 
-static inline double process_L(BiquadFilter64 *f, double inSample) {
-    double out = f->b0 * inSample + f->b1 * f->x1_L + f->b2 * f->x2_L - f->a1 * f->y1_L - f->a2 * f->y2_L;
-    f->x2_L = f->x1_L; f->x1_L = inSample;
+static inline double process_L(Biquad *f, double in) {
+    double out = f->b0 * in + f->b1 * f->x1_L + f->b2 * f->x2_L - f->a1 * f->y1_L - f->a2 * f->y2_L;
+    f->x2_L = f->x1_L; f->x1_L = in;
     f->y2_L = kill_denormal(f->y1_L); f->y1_L = kill_denormal(out);
     return out;
 }
 
-static inline double process_R(BiquadFilter64 *f, double inSample) {
-    double out = f->b0 * inSample + f->b1 * f->x1_R + f->b2 * f->x2_R - f->a1 * f->y1_R - f->a2 * f->y2_R;
-    f->x2_R = f->x1_R; f->x1_R = inSample;
+static inline double process_R(Biquad *f, double in) {
+    double out = f->b0 * in + f->b1 * f->x1_R + f->b2 * f->x2_R - f->a1 * f->y1_R - f->a2 * f->y2_R;
+    f->x2_R = f->x1_R; f->x1_R = in;
     f->y2_R = kill_denormal(f->y1_R); f->y1_R = kill_denormal(out);
     return out;
 }
 
-static void process_pcm_raw(void *data, UInt32 byteSize, UInt32 channels, BOOL isFloat, UInt32 bitsPerChannel) {
-    if (!data || byteSize == 0 || atomic_load(&gIsUpdatingFilters)) return;
-    gProcessedBufferCount++;
+static void process_pcm(void *data, UInt32 size, UInt32 ch, BOOL isFloat, UInt32 bits) {
+    if (!data || !size) return;
+    gBufCount++;
+    double preamp = pow(10.0, gPreamp / 20.0);
 
-    double preampFactor = pow(10.0, PREAMP_DB / 20.0);
-
-    if (isFloat || bitsPerChannel == 32) {
-        float *samples = (float *)data;
-        UInt32 totalSamples = byteSize / sizeof(float);
-        totalSamples -= (totalSamples % (channels > 0 ? channels : 1));
-
-        if (channels >= 2) {
-            for (UInt32 i = 0; i < totalSamples; i += channels) {
-                double sL = (double)samples[i] * preampFactor;
-                double sR = (double)samples[i + 1] * preampFactor;
-                for (int b = 0; b < NUM_BANDS; b++) {
-                    sL = process_L(&filters[b], sL);
-                    sR = process_R(&filters[b], sR);
+    if (isFloat || bits == 32) {
+        float *buf = (float *)data;
+        UInt32 count = (size / sizeof(float));
+        if (ch >= 2) {
+            count -= (count % ch);
+            for (UInt32 i = 0; i < count; i += ch) {
+                double L = buf[i] * preamp, R = buf[i + 1] * preamp;
+                for (int b = 0; b < BANDS; b++) {
+                    L = process_L(&gFilters[b], L);
+                    R = process_R(&gFilters[b], R);
                 }
-                samples[i]     = fast_soft_clip((float)sL);
-                samples[i + 1] = fast_soft_clip((float)sR);
+                buf[i] = soft_clip((float)L);
+                buf[i + 1] = soft_clip((float)R);
             }
-        } else if (channels == 1) {
-            for (UInt32 i = 0; i < totalSamples; i++) {
-                double sL = (double)samples[i] * preampFactor;
-                for (int b = 0; b < NUM_BANDS; b++) {
-                    sL = process_L(&filters[b], sL);
-                }
-                samples[i] = fast_soft_clip((float)sL);
+        } else if (ch == 1) {
+            for (UInt32 i = 0; i < count; i++) {
+                double L = buf[i] * preamp;
+                for (int b = 0; b < BANDS; b++) L = process_L(&gFilters[b], L);
+                buf[i] = soft_clip((float)L);
             }
         }
-    } else if (bitsPerChannel == 16) {
-        int16_t *samples = (int16_t *)data;
-        UInt32 totalSamples = byteSize / sizeof(int16_t);
-        totalSamples -= (totalSamples % (channels > 0 ? channels : 1));
-
-        if (channels >= 2) {
-            for (UInt32 i = 0; i < totalSamples; i += channels) {
-                double sL = ((double)samples[i] / 32768.0) * preampFactor;
-                double sR = ((double)samples[i + 1] / 32768.0) * preampFactor;
-                for (int b = 0; b < NUM_BANDS; b++) {
-                    sL = process_L(&filters[b], sL);
-                    sR = process_R(&filters[b], sR);
+    } else if (bits == 16) {
+        int16_t *buf = (int16_t *)data;
+        UInt32 count = (size / sizeof(int16_t));
+        if (ch >= 2) {
+            count -= (count % ch);
+            for (UInt32 i = 0; i < count; i += ch) {
+                double L = (buf[i] / 32768.0) * preamp;
+                double R = (buf[i + 1] / 32768.0) * preamp;
+                for (int b = 0; b < BANDS; b++) {
+                    L = process_L(&gFilters[b], L);
+                    R = process_R(&gFilters[b], R);
                 }
-                samples[i]     = (int16_t)(fast_soft_clip((float)sL) * 32767.0f);
-                samples[i + 1] = (int16_t)(fast_soft_clip((float)sR) * 32767.0f);
+                buf[i] = (int16_t)(soft_clip((float)L) * 32767.0f);
+                buf[i + 1] = (int16_t)(soft_clip((float)R) * 32767.0f);
             }
         }
     }
 }
 
-static void process_audio_buffer_list(AudioBufferList *ioData) {
-    if (!ioData || ioData->mNumberBuffers == 0 || atomic_load(&gIsUpdatingFilters)) return;
-    double preampFactor = pow(10.0, PREAMP_DB / 20.0);
+static void process_buffer_list(AudioBufferList *ioData) {
+    if (!ioData || !ioData->mNumberBuffers) return;
+    double preamp = pow(10.0, gPreamp / 20.0);
 
     if (ioData->mNumberBuffers == 2) {
-        gProcessedBufferCount++;
-        float *samplesL = (float *)ioData->mBuffers[0].mData;
-        float *samplesR = (float *)ioData->mBuffers[1].mData;
-        UInt32 totalSamples = ioData->mBuffers[0].mDataByteSize / sizeof(float);
-
-        if (samplesL && samplesR) {
-            for (UInt32 i = 0; i < totalSamples; i++) {
-                double sL = (double)samplesL[i] * preampFactor;
-                double sR = (double)samplesR[i] * preampFactor;
-
-                for (int b = 0; b < NUM_BANDS; b++) {
-                    sL = process_L(&filters[b], sL);
-                    sR = process_R(&filters[b], sR);
+        gBufCount++;
+        float *L = (float *)ioData->mBuffers[0].mData;
+        float *R = (float *)ioData->mBuffers[1].mData;
+        UInt32 count = ioData->mBuffers[0].mDataByteSize / sizeof(float);
+        if (L && R) {
+            for (UInt32 i = 0; i < count; i++) {
+                double sL = L[i] * preamp, sR = R[i] * preamp;
+                for (int b = 0; b < BANDS; b++) {
+                    sL = process_L(&gFilters[b], sL);
+                    sR = process_R(&gFilters[b], sR);
                 }
-
-                samplesL[i] = fast_soft_clip((float)sL);
-                samplesR[i] = fast_soft_clip((float)sR);
+                L[i] = soft_clip((float)sL);
+                R[i] = soft_clip((float)sR);
             }
         }
     } else if (ioData->mNumberBuffers == 1) {
-        AudioBuffer buf = ioData->mBuffers[0];
-        process_pcm_raw(buf.mData, buf.mDataByteSize, buf.mNumberChannels > 0 ? buf.mNumberChannels : 2, YES, 32);
+        AudioBuffer b = ioData->mBuffers[0];
+        process_pcm(b.mData, b.mDataByteSize, b.mNumberChannels ? b.mNumberChannels : 2, YES, 32);
     }
 }
 
-// ============================================================================
-// ХУКИ C-ФУНКЦИЙ
-// ============================================================================
-static OSStatus (*orig_AudioQueueEnqueueBuffer)(AudioQueueRef, AudioQueueBufferRef, UInt32, const AudioStreamPacketDescription *);
-static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
-static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef, AudioConverterComplexInputDataProc, void *, UInt32 *, AudioBufferList *, AudioStreamPacketDescription *);
+static OSStatus (*orig_AQEnqueue)(AudioQueueRef, AudioQueueBufferRef, UInt32, const AudioStreamPacketDescription *);
+static OSStatus (*orig_AURender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+static OSStatus (*orig_ACFill)(AudioConverterRef, AudioConverterComplexInputDataProc, void *, UInt32 *, AudioBufferList *, AudioStreamPacketDescription *);
 
-OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, UInt32 inNumPacketDescs, const AudioStreamPacketDescription *inPacketDescs) {
-    if (inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0) {
-        AudioStreamBasicDescription format;
-        UInt32 propSize = sizeof(format);
-        OSStatus err = AudioQueueGetProperty(inAQ, kAudioQueueProperty_StreamDescription, &format, &propSize);
-        if (err == noErr && format.mFormatID == kAudioFormatLinearPCM) {
-            static double lastSampleRate = 0.0;
-            double currentSampleRate = format.mSampleRate > 0 ? format.mSampleRate : 44100.0;
-            if (lastSampleRate != currentSampleRate) {
-                update_all_biquads(currentSampleRate);
-                lastSampleRate = currentSampleRate;
-            }
-            process_pcm_raw(inBuffer->mAudioData, inBuffer->mAudioDataByteSize, format.mChannelsPerFrame, (format.mFormatFlags & kLinearPCMFormatFlagIsFloat) != 0, format.mBitsPerChannel);
+static OSStatus my_AQEnqueue(AudioQueueRef aq, AudioQueueBufferRef buf, UInt32 n, const AudioStreamPacketDescription *descs) {
+    if (buf && buf->mAudioData && buf->mAudioDataByteSize) {
+        AudioStreamBasicDescription fmt;
+        UInt32 sz = sizeof(fmt);
+        if (AudioQueueGetProperty(aq, kAudioQueueProperty_StreamDescription, &fmt, &sz) == noErr && fmt.mFormatID == kAudioFormatLinearPCM) {
+            static double lastSR = 0;
+            double sr = fmt.mSampleRate > 0 ? fmt.mSampleRate : 44100.0;
+            if (lastSR != sr) { update_all_filters(sr); lastSR = sr; }
+            process_pcm(buf->mAudioData, buf->mAudioDataByteSize, fmt.mChannelsPerFrame, (fmt.mFormatFlags & kLinearPCMFormatFlagIsFloat) != 0, fmt.mBitsPerChannel);
         } else {
-            process_pcm_raw(inBuffer->mAudioData, inBuffer->mAudioDataByteSize, 2, YES, 32);
+            process_pcm(buf->mAudioData, buf->mAudioDataByteSize, 2, YES, 32);
         }
     }
-    return orig_AudioQueueEnqueueBuffer(inAQ, inBuffer, inNumPacketDescs, inPacketDescs);
+    return orig_AQEnqueue(aq, buf, n, descs);
 }
 
-OSStatus my_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
-    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
-    if (status == noErr && ioData) {
-        process_audio_buffer_list(ioData);
-    }
+static OSStatus my_AURender(AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *data) {
+    OSStatus status = orig_AURender(unit, flags, ts, bus, frames, data);
+    if (status == noErr && data) process_buffer_list(data);
     return status;
 }
 
-OSStatus my_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter, AudioConverterComplexInputDataProc inInputDataProc, void *inInputDataProcUserData, UInt32 *ioOutputDataPacketSize, AudioBufferList *outOutputData, AudioStreamPacketDescription *outPacketDescription) {
-    OSStatus status = orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc, inInputDataProcUserData, ioOutputDataPacketSize, outOutputData, outPacketDescription);
-    if (status == noErr && outOutputData) {
-        process_audio_buffer_list(outOutputData);
-    }
+static OSStatus my_ACFill(AudioConverterRef conv, AudioConverterComplexInputDataProc proc, void *user, UInt32 *packets, AudioBufferList *data, AudioStreamPacketDescription *descs) {
+    OSStatus status = orig_ACFill(conv, proc, user, packets, data, descs);
+    if (status == noErr && data) process_buffer_list(data);
     return status;
 }
 
-// ============================================================================
-// ИЗОЛИРОВАННАЯ UI-СИСТЕМА (ИММУНИТЕТ К МОДАМ ИНТЕРФЕЙСА)
-// ============================================================================
+static void init_hooks(void) {
+    void (*MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (MSHook) {
+        void *fn;
+        if ((fn = dlsym(RTLD_DEFAULT, "AudioQueueEnqueueBuffer"))) MSHook(fn, (void *)(uintptr_t)my_AQEnqueue, (void **)(uintptr_t)&orig_AQEnqueue);
+        if ((fn = dlsym(RTLD_DEFAULT, "AudioUnitRender"))) MSHook(fn, (void *)(uintptr_t)my_AURender, (void **)(uintptr_t)&orig_AURender);
+        if ((fn = dlsym(RTLD_DEFAULT, "AudioConverterFillComplexBuffer"))) MSHook(fn, (void *)(uintptr_t)my_ACFill, (void **)(uintptr_t)&orig_ACFill);
+    } else {
+        struct rebinding r[] = {
+            {"AudioQueueEnqueueBuffer", (void *)(uintptr_t)my_AQEnqueue, (void **)(uintptr_t)&orig_AQEnqueue},
+            {"AudioUnitRender", (void *)(uintptr_t)my_AURender, (void **)(uintptr_t)&orig_AURender},
+            {"AudioConverterFillComplexBuffer", (void *)(uintptr_t)my_ACFill, (void **)(uintptr_t)&orig_ACFill}
+        };
+        rebind_symbols(r, 3);
+    }
+}
 
 @interface YEQWindow : UIWindow
 @end
-
 @implementation YEQWindow
-// Пропускаем клики сквозь прозрачную область окна прямо в мод Яндекс Музыки!
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self || hitView == self.rootViewController.view) {
-        return nil;
-    }
-    return hitView;
+    UIView *v = [super hitTest:point withEvent:event];
+    return (v == self || v == self.rootViewController.view) ? nil : v;
 }
 @end
 
-@interface YEQViewController : UIViewController
+@interface YEQVC : UIViewController
 @end
-
-@implementation YEQViewController
+@implementation YEQVC
 - (BOOL)prefersStatusBarHidden { return NO; }
 @end
 
 @interface YEQManager : NSObject
 + (instancetype)shared;
 - (void)setupUI;
+- (void)loadSettings;
 @end
 
 @implementation YEQManager {
-    YEQWindow *_eqWindow;
-    YEQViewController *_eqVC;
-    UIButton *_toggleBtn;
-    UIVisualEffectView *_blurContainer;
-    UISlider *_sliders[NUM_BANDS];
-    UILabel *_valueLabels[NUM_BANDS];
+    YEQWindow *_win;
+    YEQVC *_vc;
+    UIButton *_btn;
+    UIVisualEffectView *_blur;
+    UISlider *_sliders[BANDS];
+    UILabel *_labels[BANDS];
     UISlider *_preampSlider;
     UILabel *_preampLabel;
     UIButton *_presetBtn;
     UILabel *_statusLabel;
-    NSTimer *_statusTimer;
-    UIImpactFeedbackGenerator *_hapticLight;
-    UIImpactFeedbackGenerator *_hapticMedium;
+    NSTimer *_timer;
 }
 
 + (instancetype)shared {
-    static YEQManager *inst = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ inst = [[YEQManager alloc] init]; });
-    return inst;
-}
-
-- (void)triggerHaptic:(int)type {
-    if (type == 0) {
-        if (!_hapticLight) _hapticLight = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-        [_hapticLight impactOccurred];
-    } else {
-        if (!_hapticMedium) _hapticMedium = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-        [_hapticMedium impactOccurred];
-    }
+    static YEQManager *m = nil;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ m = [[YEQManager alloc] init]; });
+    return m;
 }
 
 - (void)loadSettings {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    for (int i = 0; i < NUM_BANDS; i++) {
-        NSString *key = [NSString stringWithFormat:@"eq_band_%d", i];
-        if ([defs objectForKey:key]) {
-            GAINS_DB[i] = [defs doubleForKey:key];
-        } else {
-            GAINS_DB[i] = default_gains[i];
-        }
+    for (int i = 0; i < BANDS; i++) {
+        NSString *k = [NSString stringWithFormat:@"eq_band_%d", i];
+        gGains[i] = [defs objectForKey:k] ? [defs doubleForKey:k] : DEFAULT_GAINS[i];
     }
-    if ([defs objectForKey:@"eq_preamp"]) {
-        PREAMP_DB = [defs doubleForKey:@"eq_preamp"];
-    }
+    if ([defs objectForKey:@"eq_preamp"]) gPreamp = [defs doubleForKey:@"eq_preamp"];
 }
 
-- (void)applyGainsAndRefreshUI {
-    for (int i = 0; i < NUM_BANDS; i++) {
-        _sliders[i].value = GAINS_DB[i];
-        _valueLabels[i].text = [NSString stringWithFormat:@"%+.1f", GAINS_DB[i]];
-        [[NSUserDefaults standardUserDefaults] setDouble:GAINS_DB[i] forKey:[NSString stringWithFormat:@"eq_band_%d", i]];
+- (void)applyGains {
+    for (int i = 0; i < BANDS; i++) {
+        _sliders[i].value = gGains[i];
+        _labels[i].text = [NSString stringWithFormat:@"%+.1f", gGains[i]];
+        [[NSUserDefaults standardUserDefaults] setDouble:gGains[i] forKey:[NSString stringWithFormat:@"eq_band_%d", i]];
     }
-    _preampSlider.value = PREAMP_DB;
-    _preampLabel.text = [NSString stringWithFormat:@"%.1f dB", PREAMP_DB];
-    [[NSUserDefaults standardUserDefaults] setDouble:PREAMP_DB forKey:@"eq_preamp"];
-    update_all_biquads(gCurrentSampleRate);
+    _preampSlider.value = gPreamp;
+    _preampLabel.text = [NSString stringWithFormat:@"%.1f dB", gPreamp];
+    [[NSUserDefaults standardUserDefaults] setDouble:gPreamp forKey:@"eq_preamp"];
+    update_all_filters(gSampleRate);
 }
 
-- (void)updateStatusText {
-    if (gProcessedBufferCount == 0) {
-        _statusLabel.text = @"🔴 Ожидание звука... (Включите трек)";
+- (void)updateStatus {
+    if (gBufCount == 0) {
+        _statusLabel.text = @"🔴 Ожидание звука...";
         _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.4 alpha:1.0];
     } else {
-        _statusLabel.text = [NSString stringWithFormat:@"🟢 3D Sub DSP Active (%llu buf)", gProcessedBufferCount];
+        _statusLabel.text = [NSString stringWithFormat:@"🟢 DSP Active (%llu buf)", gBufCount];
         _statusLabel.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
     }
 }
 
 - (void)setupUI {
-    if (_eqWindow) return; // Уже создано
-
-    UIScreen *mainScreen = [UIScreen mainScreen];
-    _eqWindow = [[YEQWindow alloc] initWithFrame:mainScreen.bounds];
-    
-    // Находим активную Scene
+    if (_win) return;
+    _win = [[YEQWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     if (@available(iOS 13.0, *)) {
-        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                _eqWindow.windowScene = scene;
+        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if (s.activationState == UISceneActivationStateForegroundActive) {
+                _win.windowScene = s;
                 break;
             }
         }
     }
-    
-    _eqVC = [[YEQViewController alloc] init];
-    _eqVC.view.backgroundColor = [UIColor clearColor];
-    _eqWindow.rootViewController = _eqVC;
-    
-    // Окно эквалайзера поверх абсолютно всех модов и интерфейсов!
-    _eqWindow.windowLevel = UIWindowLevelStatusBar - 1;
-    _eqWindow.hidden = NO;
+    _vc = [[YEQVC alloc] init];
+    _vc.view.backgroundColor = [UIColor clearColor];
+    _win.rootViewController = _vc;
+    _win.windowLevel = UIWindowLevelStatusBar - 1;
+    _win.hidden = NO;
 
-    UIView *parentView = _eqVC.view;
-    CGFloat menuWidth = parentView.bounds.size.width - 32;
+    UIView *p = _vc.view;
+    CGFloat w = p.bounds.size.width - 32;
 
-    // Кнопка переключателя
-    _toggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _toggleBtn.frame = CGRectMake(16, 120, 48, 48);
-    _toggleBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.12 alpha:0.85];
-    [_toggleBtn setTitle:@"🎛️" forState:UIControlStateNormal];
-    _toggleBtn.titleLabel.font = [UIFont systemFontOfSize:22];
-    _toggleBtn.layer.cornerRadius = 24;
-    _toggleBtn.layer.cornerCurve = kCACornerCurveContinuous;
-    _toggleBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:0.9].CGColor;
-    _toggleBtn.layer.borderWidth = 1.5;
+    _btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    _btn.frame = CGRectMake(16, 120, 48, 48);
+    _btn.backgroundColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.12 alpha:0.85];
+    [_btn setTitle:@"🎛️" forState:UIControlStateNormal];
+    _btn.titleLabel.font = [UIFont systemFontOfSize:22];
+    _btn.layer.cornerRadius = 24;
+    _btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:0.9].CGColor;
+    _btn.layer.borderWidth = 1.5;
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [_toggleBtn addGestureRecognizer:pan];
-    [_toggleBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [parentView addSubview:_toggleBtn];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
+    [_btn addGestureRecognizer:pan];
+    [_btn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:_btn];
 
-    // Контейнер с размытием
-    UIBlurEffect *blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
-    _blurContainer = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
-    _blurContainer.frame = CGRectMake(16, 100, menuWidth, 510);
-    _blurContainer.layer.cornerRadius = 22;
-    _blurContainer.layer.cornerCurve = kCACornerCurveContinuous;
-    _blurContainer.layer.masksToBounds = YES;
-    _blurContainer.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.15].CGColor;
-    _blurContainer.layer.borderWidth = 0.5;
-    _blurContainer.hidden = YES;
-    _blurContainer.alpha = 0.0;
-    [parentView addSubview:_blurContainer];
+    _blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+    _blur.frame = CGRectMake(16, 100, w, 510);
+    _blur.layer.cornerRadius = 22;
+    _blur.layer.masksToBounds = YES;
+    _blur.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.15].CGColor;
+    _blur.layer.borderWidth = 0.5;
+    _blur.hidden = YES;
+    _blur.alpha = 0.0;
+    [p addSubview:_blur];
 
-    UIView *contentView = _blurContainer.contentView;
+    UIView *c = _blur.contentView;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, 110, 22)];
     title.text = @"Parametric EQ";
     title.textColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
     title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
-    [contentView addSubview:title];
+    [c addSubview:title];
 
     _presetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _presetBtn.frame = CGRectMake(menuWidth - 165, 12, 65, 28);
+    _presetBtn.frame = CGRectMake(w - 165, 12, 65, 28);
     [_presetBtn setTitle:@"Presets" forState:UIControlStateNormal];
     [_presetBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _presetBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
     _presetBtn.layer.cornerRadius = 8;
-    _presetBtn.layer.cornerCurve = kCACornerCurveContinuous;
     _presetBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    [_presetBtn addTarget:self action:@selector(showPresetMenu) forControlEvents:UIControlEventTouchUpInside];
-    [contentView addSubview:_presetBtn];
+    [_presetBtn addTarget:self action:@selector(showPresets) forControlEvents:UIControlEventTouchUpInside];
+    [c addSubview:_presetBtn];
 
     UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    saveBtn.frame = CGRectMake(menuWidth - 95, 12, 50, 28);
+    saveBtn.frame = CGRectMake(w - 95, 12, 50, 28);
     [saveBtn setTitle:@"Save" forState:UIControlStateNormal];
     [saveBtn setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
     saveBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
     saveBtn.layer.cornerRadius = 8;
-    saveBtn.layer.cornerCurve = kCACornerCurveContinuous;
     saveBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
-    [saveBtn addTarget:self action:@selector(showSavePresetAlert) forControlEvents:UIControlEventTouchUpInside];
-    [contentView addSubview:saveBtn];
+    [saveBtn addTarget:self action:@selector(savePreset) forControlEvents:UIControlEventTouchUpInside];
+    [c addSubview:saveBtn];
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.frame = CGRectMake(menuWidth - 38, 12, 28, 28);
+    closeBtn.frame = CGRectMake(w - 38, 12, 28, 28);
     [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     closeBtn.backgroundColor = [UIColor colorWithRed:0.9 green:0.2 blue:0.2 alpha:0.8];
     closeBtn.layer.cornerRadius = 14;
     closeBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
-    [closeBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [contentView addSubview:closeBtn];
+    [closeBtn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    [c addSubview:closeBtn];
 
-    UILabel *preampTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 65, 20)];
-    preampTitle.text = @"Preamp:";
-    preampTitle.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
-    preampTitle.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
-    [contentView addSubview:preampTitle];
+    UILabel *preLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 65, 20)];
+    preLabel.text = @"Preamp:";
+    preLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+    preLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
+    [c addSubview:preLabel];
 
-    _preampSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 48, menuWidth - 155, 20)];
+    _preampSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 48, w - 155, 20)];
     _preampSlider.minimumValue = -12.0;
     _preampSlider.maximumValue = 0.0;
     _preampSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
-    _preampSlider.value = PREAMP_DB;
-    [_preampSlider addTarget:self action:@selector(preampChanged:) forControlEvents:UIControlEventValueChanged];
-    [contentView addSubview:_preampSlider];
+    _preampSlider.value = gPreamp;
+    [_preampSlider addTarget:self action:@selector(onPreamp:) forControlEvents:UIControlEventValueChanged];
+    [c addSubview:_preampSlider];
 
-    _preampLabel = [[UILabel alloc] initWithFrame:CGRectMake(menuWidth - 70, 48, 56, 20)];
-    _preampLabel.text = [NSString stringWithFormat:@"%.1f dB", PREAMP_DB];
+    _preampLabel = [[UILabel alloc] initWithFrame:CGRectMake(w - 70, 48, 56, 20)];
+    _preampLabel.text = [NSString stringWithFormat:@"%.1f dB", gPreamp];
     _preampLabel.textColor = [UIColor whiteColor];
     _preampLabel.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightBold];
     _preampLabel.textAlignment = NSTextAlignmentRight;
-    [contentView addSubview:_preampLabel];
+    [c addSubview:_preampLabel];
 
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(16, 76, menuWidth - 32, 0.5)];
-    line.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
-    [contentView addSubview:line];
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(16, 76, w - 32, 0.5)];
+    div.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
+    [c addSubview:div];
 
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 82, menuWidth - 16, 380)];
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 82, w - 16, 380)];
     scroll.showsVerticalScrollIndicator = NO;
-    [contentView addSubview:scroll];
+    [c addSubview:scroll];
 
     int y = 6;
-    for (int i = 0; i < NUM_BANDS; i++) {
+    for (int i = 0; i < BANDS; i++) {
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, y, 60, 26)];
-        lbl.text = (i == 0) ? @"SubShelf" : (FREQUENCIES[i] >= 1000 ? [NSString stringWithFormat:@"%.1fkHz", FREQUENCIES[i]/1000.0] : [NSString stringWithFormat:@"%.0fHz", FREQUENCIES[i]]);
+        lbl.text = (i == 0) ? @"Sub" : (FREQS[i] >= 1000 ? [NSString stringWithFormat:@"%.1fk", FREQS[i] / 1000.0] : [NSString stringWithFormat:@"%.0f", FREQS[i]]);
         lbl.textColor = (i == 0) ? [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0] : [UIColor whiteColor];
-        lbl.font = [UIFont systemFontOfSize:(i == 0 ? 11 : 12) weight:UIFontWeightSemibold];
+        lbl.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
         [scroll addSubview:lbl];
 
-        UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        minusBtn.frame = CGRectMake(68, y, 28, 26);
-        [minusBtn setTitle:@"-" forState:UIControlStateNormal];
-        [minusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        minusBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-        minusBtn.layer.cornerRadius = 6;
-        minusBtn.layer.cornerCurve = kCACornerCurveContinuous;
-        minusBtn.tag = i;
-        [minusBtn addTarget:self action:@selector(stepMinus:) forControlEvents:UIControlEventTouchUpInside];
-        [scroll addSubview:minusBtn];
+        UIButton *mBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        mBtn.frame = CGRectMake(68, y, 28, 26);
+        [mBtn setTitle:@"-" forState:UIControlStateNormal];
+        [mBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        mBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        mBtn.layer.cornerRadius = 6;
+        mBtn.tag = i;
+        [mBtn addTarget:self action:@selector(onMinus:) forControlEvents:UIControlEventTouchUpInside];
+        [scroll addSubview:mBtn];
 
-        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(102, y, scroll.bounds.size.width - 204, 26)];
-        slider.minimumValue = -15.0;
-        slider.maximumValue = +15.0;
-        slider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
-        slider.value = GAINS_DB[i];
-        slider.tag = i;
-        [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-        _sliders[i] = slider;
-        [scroll addSubview:slider];
+        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(102, y, scroll.bounds.size.width - 204, 26)];
+        sl.minimumValue = -15.0;
+        sl.maximumValue = 15.0;
+        sl.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
+        sl.value = gGains[i];
+        sl.tag = i;
+        [sl addTarget:self action:@selector(onSlider:) forControlEvents:UIControlEventValueChanged];
+        _sliders[i] = sl;
+        [scroll addSubview:sl];
 
-        UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        plusBtn.frame = CGRectMake(scroll.bounds.size.width - 94, y, 28, 26);
-        [plusBtn setTitle:@"+" forState:UIControlStateNormal];
-        [plusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        plusBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-        plusBtn.layer.cornerRadius = 6;
-        plusBtn.layer.cornerCurve = kCACornerCurveContinuous;
-        plusBtn.tag = i;
-        [plusBtn addTarget:self action:@selector(stepPlus:) forControlEvents:UIControlEventTouchUpInside];
-        [scroll addSubview:plusBtn];
+        UIButton *pBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        pBtn.frame = CGRectMake(scroll.bounds.size.width - 94, y, 28, 26);
+        [pBtn setTitle:@"+" forState:UIControlStateNormal];
+        [pBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        pBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        pBtn.layer.cornerRadius = 6;
+        pBtn.tag = i;
+        [pBtn addTarget:self action:@selector(onPlus:) forControlEvents:UIControlEventTouchUpInside];
+        [scroll addSubview:pBtn];
 
-        UILabel *valLbl = [[UILabel alloc] initWithFrame:CGRectMake(scroll.bounds.size.width - 62, y, 58, 26)];
-        valLbl.text = [NSString stringWithFormat:@"%+.1f", GAINS_DB[i]];
-        valLbl.textColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
-        valLbl.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
-        valLbl.textAlignment = NSTextAlignmentRight;
-        _valueLabels[i] = valLbl;
-        [scroll addSubview:valLbl];
+        UILabel *vLbl = [[UILabel alloc] initWithFrame:CGRectMake(scroll.bounds.size.width - 62, y, 58, 26)];
+        vLbl.text = [NSString stringWithFormat:@"%+.1f", gGains[i]];
+        vLbl.textColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.0 alpha:1.0];
+        vLbl.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
+        vLbl.textAlignment = NSTextAlignmentRight;
+        _labels[i] = vLbl;
+        [scroll addSubview:vLbl];
 
         y += 45;
     }
-
     scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 10);
 
-    UIView *line2 = [[UIView alloc] initWithFrame:CGRectMake(16, 470, menuWidth - 32, 0.5)];
-    line2.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
-    [contentView addSubview:line2];
+    UIView *div2 = [[UIView alloc] initWithFrame:CGRectMake(16, 470, w - 32, 0.5)];
+    div2.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
+    [c addSubview:div2];
 
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 478, menuWidth - 32, 20)];
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 478, w - 32, 20)];
     _statusLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
     _statusLabel.textAlignment = NSTextAlignmentCenter;
-    [self updateStatusText];
-    [contentView addSubview:_statusLabel];
+    [self updateStatus];
+    [c addSubview:_statusLabel];
 
-    _statusTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateStatusText) userInfo:nil repeats:YES];
+    _timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateStatus) userInfo:nil repeats:YES];
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint translation = [pan translationInView:_toggleBtn.superview];
-    CGFloat newX = _toggleBtn.center.x + translation.x;
-    CGFloat newY = _toggleBtn.center.y + translation.y;
-    
-    CGFloat minX = 30, maxX = _toggleBtn.superview.bounds.size.width - 30;
-    CGFloat minY = 60, maxY = _toggleBtn.superview.bounds.size.height - 60;
-    
-    if (newX < minX) newX = minX; if (newX > maxX) newX = maxX;
-    if (newY < minY) newY = minY; if (newY > maxY) newY = maxY;
-
-    _toggleBtn.center = CGPointMake(newX, newY);
-    [pan setTranslation:CGPointZero inView:_toggleBtn.superview];
+- (void)onPan:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:_btn.superview];
+    CGFloat x = fmin(fmax(_btn.center.x + t.x, 30), _btn.superview.bounds.size.width - 30);
+    CGFloat y = fmin(fmax(_btn.center.y + t.y, 60), _btn.superview.bounds.size.height - 60);
+    _btn.center = CGPointMake(x, y);
+    [p setTranslation:CGPointZero inView:_btn.superview];
 }
 
-- (void)toggleMenu {
-    [self triggerHaptic:1];
-    BOOL isHidden = _blurContainer.hidden;
-    
-    if (isHidden) {
-        _blurContainer.hidden = NO;
-        [UIView animateWithDuration:0.25 animations:^{
-            self->_blurContainer.alpha = 1.0;
-        }];
-    } else {
-        [UIView animateWithDuration:0.2 animations:^{
-            self->_blurContainer.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            self->_blurContainer.hidden = YES;
-        }];
-    }
-}
-
-- (void)sliderChanged:(UISlider *)slider {
-    int idx = (int)slider.tag;
-    GAINS_DB[idx] = slider.value;
-    _valueLabels[idx].text = [NSString stringWithFormat:@"%+.1f", slider.value];
-    update_biquad_single(idx, gCurrentSampleRate);
-    [[NSUserDefaults standardUserDefaults] setDouble:slider.value forKey:[NSString stringWithFormat:@"eq_band_%d", idx]];
-}
-
-- (void)stepMinus:(UIButton *)btn {
-    [self triggerHaptic:0];
-    int idx = (int)btn.tag;
-    float val = _sliders[idx].value - 0.5f;
-    if (val < -15.0f) val = -15.0f;
-    _sliders[idx].value = val;
-    [self sliderChanged:_sliders[idx]];
-}
-
-- (void)stepPlus:(UIButton *)btn {
-    [self triggerHaptic:0];
-    int idx = (int)btn.tag;
-    float val = _sliders[idx].value + 0.5f;
-    if (val > 15.0f) val = 15.0f;
-    _sliders[idx].value = val;
-    [self sliderChanged:_sliders[idx]];
-}
-
-- (void)preampChanged:(UISlider *)slider {
-    PREAMP_DB = slider.value;
-    _preampLabel.text = [NSString stringWithFormat:@"%.1f dB", PREAMP_DB];
-    [[NSUserDefaults standardUserDefaults] setDouble:slider.value forKey:@"eq_preamp"];
-}
-
-- (void)showSavePresetAlert {
-    [self triggerHaptic:0];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Сохранить пресет" message:@"Введите название для ваших настроек:" preferredStyle:UIAlertControllerStyleAlert];
-    
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.placeholder = @"Например: Мои AirPods";
+- (void)toggle {
+    BOOL show = _blur.hidden;
+    if (show) _blur.hidden = NO;
+    [UIView animateWithDuration:0.2 animations:^{
+        self->_blur.alpha = show ? 1.0 : 0.0;
+    } completion:^(BOOL f) {
+        if (!show) self->_blur.hidden = YES;
     }];
+}
 
-    UIAlertAction *saveAction = [UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *name = alert.textFields.firstObject.text;
-        if (name && name.length > 0) {
-            NSMutableDictionary *presets = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"eq_custom_presets"] mutableCopy];
-            if (!presets) presets = [NSMutableDictionary dictionary];
+- (void)onSlider:(UISlider *)s {
+    int i = (int)s.tag;
+    gGains[i] = s.value;
+    _labels[i].text = [NSString stringWithFormat:@"%+.1f", s.value];
+    update_filter(i, gSampleRate);
+    [[NSUserDefaults standardUserDefaults] setDouble:s.value forKey:[NSString stringWithFormat:@"eq_band_%d", i]];
+}
 
-            NSMutableArray *gainsArr = [NSMutableArray array];
-            for (int i = 0; i < NUM_BANDS; i++) {
-                [gainsArr addObject:@(GAINS_DB[i])];
-            }
+- (void)onMinus:(UIButton *)b {
+    int i = (int)b.tag;
+    _sliders[i].value = fmax(_sliders[i].value - 0.5f, -15.0f);
+    [self onSlider:_sliders[i]];
+}
 
-            NSDictionary *presetData = @{
-                @"gains": gainsArr,
-                @"preamp": @(PREAMP_DB)
-            };
+- (void)onPlus:(UIButton *)b {
+    int i = (int)b.tag;
+    _sliders[i].value = fmin(_sliders[i].value + 0.5f, 15.0f);
+    [self onSlider:_sliders[i]];
+}
 
-            [presets setObject:presetData forKey:name];
-            [[NSUserDefaults standardUserDefaults] setObject:presets forKey:@"eq_custom_presets"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
+- (void)onPreamp:(UISlider *)s {
+    gPreamp = s.value;
+    _preampLabel.text = [NSString stringWithFormat:@"%.1f dB", gPreamp];
+    [[NSUserDefaults standardUserDefaults] setDouble:s.value forKey:@"eq_preamp"];
+}
+
+- (void)savePreset {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Сохранить пресет" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) { t.placeholder = @"Название"; }];
+    [a addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+        NSString *name = a.textFields.firstObject.text;
+        if (name.length) {
+            NSMutableDictionary *dict = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"eq_presets"] mutableCopy] ?: [NSMutableDictionary dictionary];
+            NSMutableArray *g = [NSMutableArray array];
+            for (int i = 0; i < BANDS; i++) [g addObject:@(gGains[i])];
+            dict[name] = @{@"gains": g, @"preamp": @(gPreamp)};
+            [[NSUserDefaults standardUserDefaults] setObject:dict forKey:@"eq_presets"];
         }
-    }];
-
-    [alert addAction:saveAction];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
-    
-    // Презентуем строго из нашего изолированного контроллера без риска вылета!
-    [_eqVC presentViewController:alert animated:YES completion:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+    [_vc presentViewController:a animated:YES completion:nil];
 }
 
-- (void)showPresetMenu {
-    [self triggerHaptic:0];
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Пресеты" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🔄 Flat (Сбросить в 0)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = 0.0;
-        PREAMP_DB = 0.0;
-        [self applyGainsAndRefreshUI];
+- (void)showPresets {
+    UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Пресеты" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [s addAction:[UIAlertAction actionWithTitle:@"Flat" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        for (int i = 0; i < BANDS; i++) gGains[i] = 0.0;
+        gPreamp = 0.0;
+        [self applyGains];
+    }]];
+    [s addAction:[UIAlertAction actionWithTitle:@"3D Bass" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        double bass[BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0};
+        for (int i = 0; i < BANDS; i++) gGains[i] = bass[i];
+        gPreamp = -5.0;
+        [self applyGains];
     }]];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🔊 3D Subwoofer (Глубокий гул)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double sub_gains[NUM_BANDS] = {8.0, 5.0, 3.0, -2.0, -4.0, 0.0, 1.0};
-        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = sub_gains[i];
-        PREAMP_DB = -5.0;
-        [self applyGainsAndRefreshUI];
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"🎧 Club Punch (Плотный кач)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double club_gains[NUM_BANDS] = {6.0, 8.0, 6.0, 2.0, -3.0, 0.0, 2.0};
-        for (int i = 0; i < NUM_BANDS; i++) GAINS_DB[i] = club_gains[i];
-        PREAMP_DB = -6.0;
-        [self applyGainsAndRefreshUI];
-    }]];
-
-    NSDictionary *presets = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"eq_custom_presets"];
-    for (NSString *presetName in presets.allKeys) {
-        [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"⭐ %@", presetName] style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSDictionary *data = presets[presetName];
-            NSArray *gains = data[@"gains"];
-            NSNumber *preamp = data[@"preamp"];
-
-            if (gains && gains.count == NUM_BANDS) {
-                for (int i = 0; i < NUM_BANDS; i++) {
-                    GAINS_DB[i] = [gains[i] doubleValue];
-                }
-            }
-            if (preamp) PREAMP_DB = [preamp doubleValue];
-            [self applyGainsAndRefreshUI];
+    NSDictionary *presets = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"eq_presets"];
+    for (NSString *k in presets) {
+        [s addAction:[UIAlertAction actionWithTitle:k style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            NSArray *g = presets[k][@"gains"];
+            if (g.count == BANDS) for (int i = 0; i < BANDS; i++) gGains[i] = [g[i] doubleValue];
+            if (presets[k][@"preamp"]) gPreamp = [presets[k][@"preamp"] doubleValue];
+            [self applyGains];
         }]];
     }
-
-    if (presets && presets.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"🗑️ Удалить пресет..." style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-            [self showDeletePresetMenu];
-        }]];
-    }
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
-    
-    sheet.popoverPresentationController.sourceView = _presetBtn;
-    sheet.popoverPresentationController.sourceRect = _presetBtn.bounds;
-
-    [_eqVC presentViewController:sheet animated:YES completion:nil];
-}
-
-- (void)showDeletePresetMenu {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Удалить пресет" message:@"Выберите пресет для удаления:" preferredStyle:UIAlertControllerStyleActionSheet];
-    NSMutableDictionary *presets = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"eq_custom_presets"] mutableCopy];
-
-    for (NSString *presetName in presets.allKeys) {
-        [sheet addAction:[UIAlertAction actionWithTitle:presetName style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-            [presets removeObjectForKey:presetName];
-            [[NSUserDefaults standardUserDefaults] setObject:presets forKey:@"eq_custom_presets"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }]];
-    }
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
-    [_eqVC presentViewController:sheet animated:YES completion:nil];
+    [s addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+    s.popoverPresentationController.sourceView = _presetBtn;
+    [_vc presentViewController:s animated:YES completion:nil];
 }
 @end
 
-// ============================================================================
-// БЕЗОПАСНЫЙ СТАРТ
-// ============================================================================
 __attribute__((constructor))
 static void init_eq_tweak(void) {
     [[YEQManager shared] loadSettings];
-
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
-        
-        // Даём моду 2 секунды на рендеринг своего интерфейса
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            static dispatch_once_t onceToken;
-            dispatch_once(&onceToken, ^{
-                
-                struct rebinding rebinds[3];
-                rebinds[0].name = "AudioQueueEnqueueBuffer";
-                rebinds[0].replacement = (void *)(uintptr_t)my_AudioQueueEnqueueBuffer;
-                rebinds[0].replaced = (void **)(uintptr_t)&orig_AudioQueueEnqueueBuffer;
-
-                rebinds[1].name = "AudioUnitRender";
-                rebinds[1].replacement = (void *)(uintptr_t)my_AudioUnitRender;
-                rebinds[1].replaced = (void **)(uintptr_t)&orig_AudioUnitRender;
-
-                rebinds[2].name = "AudioConverterFillComplexBuffer";
-                rebinds[2].replacement = (void *)(uintptr_t)my_AudioConverterFillComplexBuffer;
-                rebinds[2].replaced = (void **)(uintptr_t)&orig_AudioConverterFillComplexBuffer;
-                
-                rebind_symbols(rebinds, 3);
-
-                // Создаём изолированный UI
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                init_hooks();
                 [[YEQManager shared] setupUI];
             });
         });
