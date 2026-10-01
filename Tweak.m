@@ -3,7 +3,6 @@
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <math.h>
-#include "fishhook.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -201,13 +200,6 @@ static void init_hooks(void) {
         if ((fn = dlsym(RTLD_DEFAULT, "AudioQueueEnqueueBuffer"))) MSHook(fn, (void *)(uintptr_t)my_AQEnqueue, (void **)(uintptr_t)&orig_AQEnqueue);
         if ((fn = dlsym(RTLD_DEFAULT, "AudioUnitRender"))) MSHook(fn, (void *)(uintptr_t)my_AURender, (void **)(uintptr_t)&orig_AURender);
         if ((fn = dlsym(RTLD_DEFAULT, "AudioConverterFillComplexBuffer"))) MSHook(fn, (void *)(uintptr_t)my_ACFill, (void **)(uintptr_t)&orig_ACFill);
-    } else {
-        struct rebinding r[] = {
-            {"AudioQueueEnqueueBuffer", (void *)(uintptr_t)my_AQEnqueue, (void **)(uintptr_t)&orig_AQEnqueue},
-            {"AudioUnitRender", (void *)(uintptr_t)my_AURender, (void **)(uintptr_t)&orig_AURender},
-            {"AudioConverterFillComplexBuffer", (void *)(uintptr_t)my_ACFill, (void **)(uintptr_t)&orig_ACFill}
-        };
-        rebind_symbols(r, 3);
     }
 }
 
@@ -226,13 +218,13 @@ static void init_hooks(void) {
 - (BOOL)prefersStatusBarHidden { return NO; }
 @end
 
-@interface YEQManager : NSObject
+@interface EQManager : NSObject
 + (instancetype)shared;
 - (void)setupUI;
 - (void)loadSettings;
 @end
 
-@implementation YEQManager {
+@implementation EQManager {
     YEQWindow *_win;
     YEQVC *_vc;
     UIButton *_btn;
@@ -247,9 +239,9 @@ static void init_hooks(void) {
 }
 
 + (instancetype)shared {
-    static YEQManager *m = nil;
+    static EQManager *m = nil;
     static dispatch_once_t t;
-    dispatch_once(&t, ^{ m = [[YEQManager alloc] init]; });
+    dispatch_once(&t, ^{ m = [[EQManager alloc] init]; });
     return m;
 }
 
@@ -298,7 +290,7 @@ static void init_hooks(void) {
     _vc = [[YEQVC alloc] init];
     _vc.view.backgroundColor = [UIColor clearColor];
     _win.rootViewController = _vc;
-    _win.windowLevel = UIWindowLevelStatusBar - 1;
+    _win.windowLevel = UIWindowLevelStatusBar + 100;
     _win.hidden = NO;
 
     UIView *p = _vc.view;
@@ -550,13 +542,13 @@ static void init_hooks(void) {
 
 __attribute__((constructor))
 static void init_eq_tweak(void) {
-    [[YEQManager shared] loadSettings];
+    [[EQManager shared] loadSettings];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             static dispatch_once_t once;
             dispatch_once(&once, ^{
                 init_hooks();
-                [[YEQManager shared] setupUI];
+                [[EQManager shared] setupUI];
             });
         });
     }];
